@@ -4,7 +4,7 @@ from app.main import create_app
 
 
 def test_health_check() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(provision_owner_on_startup=False))
 
     response = client.get("/health")
 

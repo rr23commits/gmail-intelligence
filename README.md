@@ -12,9 +12,17 @@ This repository currently contains only the project foundation:
 - Local PostgreSQL Docker Compose configuration
 - SQLAlchemy session and configuration setup
 - Alembic migration setup and an empty baseline migration
+- A local owner user is automatically provisioned when the backend starts
+- macOS Keychain token-store abstraction (no OAuth flow or Gmail tokens yet)
 
 Gmail integration, user accounts, and application features intentionally begin
 in later milestones.
+
+Milestone 2 adds the identity and Gmail-account database foundation. OAuth,
+Gmail API calls, synchronization, and frontend account management are still not
+implemented. When OAuth is added, refresh tokens will be stored in macOS
+Keychain; PostgreSQL will retain only non-secret credential metadata and a
+Keychain reference.
 
 ## Local setup
 
