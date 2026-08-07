@@ -8,7 +8,6 @@ def test_expected_tables_are_registered() -> None:
         "feedback_events",
         "gmail_accounts",
         "gmail_messages",
-        "gmail_oauth_credentials",
         "gmail_sync_states",
         "gmail_threads",
         "recommendations",
@@ -17,14 +16,8 @@ def test_expected_tables_are_registered() -> None:
     }
 
 
-def test_oauth_metadata_table_cannot_store_tokens() -> None:
-    columns = Base.metadata.tables["gmail_oauth_credentials"].columns.keys()
-
-    assert "refresh_token" not in columns
-    assert "refresh_token_ciphertext" not in columns
-    assert "access_token" not in columns
-    assert "access_token_ciphertext" not in columns
-    assert {"credential_store", "credential_reference", "granted_scopes"} <= set(columns)
+def test_no_oauth_credentials_table_is_registered() -> None:
+    assert "gmail_oauth_credentials" not in Base.metadata.tables
 
 
 def test_gmail_thread_and_message_ids_are_account_scoped() -> None:

@@ -1,6 +1,6 @@
 """SQLAlchemy persistence models loaded for Alembic metadata discovery."""
 
-from app.models.gmail_account import GmailAccount, GmailOAuthCredential, GmailSyncState
+from app.models.gmail_account import GmailAccount, GmailSyncState
 from app.models.gmail_data import (
     Classification,
     FeedbackEvent,
@@ -16,7 +16,6 @@ __all__ = [
     "FeedbackEvent",
     "GmailAccount",
     "GmailMessage",
-    "GmailOAuthCredential",
     "GmailSyncState",
     "GmailThread",
     "Recommendation",

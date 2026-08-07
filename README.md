@@ -18,11 +18,11 @@ This repository currently contains only the project foundation:
 Gmail integration, user accounts, and application features intentionally begin
 in later milestones.
 
-Milestone 2 adds the identity and Gmail-account database foundation. OAuth,
-Gmail API calls, synchronization, and frontend account management are still not
-implemented. When OAuth is added, refresh tokens will be stored in macOS
-Keychain; PostgreSQL will retain only non-secret credential metadata and a
-Keychain reference.
+Milestone 3 adds Gmail OAuth, macOS Keychain-only refresh-token storage,
+account connect/disconnect and manual sync controls, and the Dashboard,
+Intelligence, and Accounts views. PostgreSQL stores account metadata and the
+messages/intelligence required by those views; it does not store OAuth tokens
+or OAuth credential metadata.
 
 ## Local setup
 

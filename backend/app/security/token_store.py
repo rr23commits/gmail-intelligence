@@ -13,7 +13,7 @@ class TokenStore(ABC):
 
     @abstractmethod
     def save_refresh_token(self, *, gmail_account_id: uuid.UUID, refresh_token: str) -> str:
-        """Save a secret and return a non-secret reference suitable for PostgreSQL."""
+        """Save a secret in the platform token store."""
 
     @abstractmethod
     def get_refresh_token(self, *, gmail_account_id: uuid.UUID) -> str:

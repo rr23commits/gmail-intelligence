@@ -40,3 +40,6 @@ class GmailAccountRepository:
             GmailAccount.created_at
         )
         return list(self._session.scalars(statement))
+
+    def delete(self, account: GmailAccount) -> None:
+        self._session.delete(account)

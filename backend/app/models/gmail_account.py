@@ -4,17 +4,15 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
-    CheckConstraint,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
     String,
-    Text,
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, UUID
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -51,35 +49,6 @@ class GmailAccount(Base):
     )
 
     owner: Mapped[User] = relationship(back_populates="gmail_accounts")
-
-
-class GmailOAuthCredential(Base):
-    """Non-secret OAuth metadata and a reference to a Keychain credential item."""
-
-    __tablename__ = "gmail_oauth_credentials"
-    __table_args__ = (
-        ForeignKeyConstraint(
-            ["gmail_account_id", "user_id"],
-            ["gmail_accounts.id", "gmail_accounts.user_id"],
-            name="fk_oauth_credentials_account_owner",
-            ondelete="CASCADE",
-        ),
-        UniqueConstraint("credential_store", "credential_reference", name="uq_oauth_credential_reference"),
-        CheckConstraint(
-            "credential_store = 'macos_keychain'", name="ck_oauth_credentials_v1_keychain_only"
-        ),
-    )
-
-    gmail_account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
-    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
-    credential_store: Mapped[str] = mapped_column(String(64), nullable=False, server_default="macos_keychain")
-    credential_reference: Mapped[str] = mapped_column(String(512), nullable=False)
-    granted_scopes: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)
-    credential_status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="active")
-    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
-    )
 
 
 class GmailSyncState(Base):

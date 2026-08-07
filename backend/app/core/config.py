@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     database_url: str
     local_owner_email: str = "local-owner@localhost"
     local_owner_display_name: str = "Local Owner"
+    google_oauth_client_id: str = ""
+    google_oauth_client_secret: str = ""
+    google_oauth_redirect_uri: str = "http://localhost:8000/api/v1/auth/gmail/callback"
+    frontend_url: str = "http://localhost:3000"
 
 
 @lru_cache
