@@ -220,6 +220,18 @@ def create_app(*, provision_owner_on_startup: bool = True) -> FastAPI:
     ) -> list[dict]:
         return GmailIntelligenceService(session).sender_groups(user_id=local_owner.id, account_id=account_id)
 
+    @app.get("/api/v1/intelligence/learned-preferences", tags=["intelligence"])
+    def learned_preferences(
+        account_id: uuid.UUID,
+        local_owner=Depends(owner),
+        session: Session = Depends(get_db_session),
+    ) -> list[dict]:
+        if GmailAccountRepository(session).get_for_user(user_id=local_owner.id, account_id=account_id) is None:
+            raise HTTPException(404, "Gmail account not found.")
+        return GmailIntelligenceService(session).learned_preferences(
+            user_id=local_owner.id, account_id=account_id
+        )
+
     @app.get("/api/v1/intelligence/cleanup", tags=["intelligence"])
     def intelligence_cleanup(
         account_id: uuid.UUID | None = None,

@@ -4,7 +4,13 @@ from types import SimpleNamespace
 
 from app.classification.m5 import ThreadSnapshot, classify_thread
 from app.models.gmail_account import GmailAccount
-from app.models.gmail_data import Classification, GmailMessage, GmailThread, SyncRun
+from app.models.gmail_data import (
+    Classification,
+    ClassificationFeedback,
+    GmailMessage,
+    GmailThread,
+    SyncRun,
+)
 from app.services.gmail_intelligence_service import (
     CLEAN_UP,
     CONSIDER,
@@ -146,6 +152,77 @@ def test_same_thread_messages_flush_current_handoff_before_next_classification()
     GmailIntelligenceService(session)._save_message(session.thread.user_id, account, raw)  # type: ignore[arg-type]
 
     assert session.added and any(isinstance(value, Classification) and value.is_current for value in session.added)
+
+
+def test_two_corrections_change_a_later_synced_message(monkeypatch) -> None:
+    user_id, account_id = uuid.uuid4(), uuid.uuid4()
+    thread = GmailThread(
+        id=uuid.uuid4(),
+        user_id=user_id,
+        gmail_account_id=account_id,
+        gmail_thread_id="later-thread",
+        latest_message_at=datetime.now(UTC),
+    )
+    feedback = [
+        ClassificationFeedback(
+            user_id=user_id,
+            gmail_account_id=account_id,
+            thread_id=uuid.uuid4(),
+            original_category="notification",
+            corrected_category="promotional_bulk",
+            classifier_version="m5.1-local",
+            sender_address="news@sender.test",
+            sender_domain="sender.test",
+        )
+        for _ in range(2)
+    ]
+
+    class FeedbackSyncSession(ExistingThreadSession):
+        def scalars(self, _statement):
+            return feedback
+
+    monkeypatch.setattr(
+        "app.services.gmail_intelligence_service.classify_thread_m5_1",
+        lambda _snapshot: SimpleNamespace(
+            category="notification",
+            priority_score=20,
+            confidence=0.9,
+            explanation={"summary": "Notice", "reasons": []},
+        ),
+    )
+    session = FeedbackSyncSession(thread)
+    account = GmailAccount(
+        id=account_id,
+        user_id=user_id,
+        gmail_email="user@example.com",
+        gmail_email_normalized="user@example.com",
+        gmail_profile_id="profile",
+    )
+    raw = {
+        "id": "later-message",
+        "threadId": "later-thread",
+        "internalDate": "0",
+        "snippet": "Newsletter",
+        "labelIds": ["INBOX"],
+        "payload": {
+            "body": {"data": "TmV3c2xldHRlcg"},
+            "headers": [
+                {"name": "From", "value": "news@sender.test"},
+                {"name": "To", "value": "user@example.com"},
+                {"name": "Subject", "value": "Newsletter"},
+            ],
+        },
+    }
+
+    GmailIntelligenceService(session)._save_message(user_id, account, raw)  # type: ignore[arg-type]
+
+    current = next(
+        item
+        for item in session.added
+        if isinstance(item, Classification) and item.is_current
+    )
+    assert current.category == "promotional_bulk"
+    assert current.classifier_version == "m5.1-feedback-local"
 
 
 def test_duplicate_sync_request_is_rejected_before_gmail_work() -> None:

@@ -16,6 +16,7 @@ export type IntelligenceItem = { id: string; account_id: string; account: string
 export type IntelligenceDetail = IntelligenceItem & { explanation: IntelligenceExplanation; classifier_version: string; gmail_url: string; categories: string[]; messages: { from: string; subject: string | null; body: string; at: string }[] };
 export type IntelligenceOverview = { total_analyzed: number; categories: Record<string, number>; needs_attention: number; opportunities: number; important: number; low_priority: number; promotional: number; notifications: number; decisions: Record<string, number> };
 export type SenderGroup = { sender: string; total: number; categories: Record<string, number>; decisions: Record<string, number> };
+export type LearnedPreference = { domain: string; original_category: string; learned_category: string; correction_count: number };
 export type CleanupGroup = { key: string; title: string; description: string; items: IntelligenceItem[] };
 export type Cleanup = { total_impact: number; groups: CleanupGroup[] };
 export type Account = { id: string; email: string; name: string | null; status: string; last_synced_at: string | null };
@@ -33,6 +34,7 @@ export const getIntelligence = (filter: IntelligenceFilter = {}) => {
 export const getIntelligenceDetail = (id: string) => api<IntelligenceDetail>(`/api/v1/intelligence/${id}`);
 export const getIntelligenceOverview = (accountId?: string) => api<IntelligenceOverview>(`/api/v1/intelligence/overview${accountId ? `?account_id=${accountId}` : ""}`);
 export const getSenderGroups = (accountId?: string) => api<SenderGroup[]>(`/api/v1/intelligence/senders${accountId ? `?account_id=${accountId}` : ""}`);
+export const getLearnedPreferences = (accountId: string) => api<LearnedPreference[]>(`/api/v1/intelligence/learned-preferences?account_id=${accountId}`);
 export const getCleanup = (accountId?: string) => api<Cleanup>(`/api/v1/intelligence/cleanup${accountId ? `?account_id=${accountId}` : ""}`);
 export const correctClassification = (id: string, correctedCategory: string) => api<IntelligenceItem>(`/api/v1/intelligence/${id}/classification-feedback`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ corrected_category: correctedCategory }) });
 export const applyThreadAction = (accountId: string, action: "archive" | "delete" | "mark_read" | "mark_unread", threadIds: string[]) => api<{ updated: number }>(`/api/v1/accounts/${accountId}/threads/action`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, thread_ids: threadIds }) });

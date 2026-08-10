@@ -251,6 +251,45 @@ class GmailIntelligenceService:
             group["decisions"][_decision_bucket(classification.category, classification.priority_score)] += 1
         return sorted(groups.values(), key=lambda group: (-group["total"], group["sender"]))
 
+    def learned_preferences(self, *, user_id: uuid.UUID, account_id: uuid.UUID) -> list[dict]:
+        feedback = [
+            FeedbackSignal(
+                sender_domain=item.sender_domain,
+                original_category=item.original_category,
+                corrected_category=item.corrected_category,
+            )
+            for item in self.session.scalars(
+                select(ClassificationFeedback).where(
+                    ClassificationFeedback.user_id == user_id,
+                    ClassificationFeedback.gmail_account_id == account_id,
+                )
+            )
+        ]
+        preferences = []
+        for domain, original_category in sorted({(item.sender_domain, item.original_category) for item in feedback}):
+            adjusted = apply_feedback(
+                ClassificationDecision(original_category, 0, 1.0, {}),
+                sender_domain=domain,
+                feedback=feedback,
+            )
+            if adjusted.category == original_category:
+                continue
+            count = sum(
+                item.sender_domain == domain
+                and item.original_category == original_category
+                and item.corrected_category == adjusted.category
+                for item in feedback
+            )
+            preferences.append(
+                {
+                    "domain": domain,
+                    "original_category": original_category,
+                    "learned_category": adjusted.category,
+                    "correction_count": count,
+                }
+            )
+        return sorted(preferences, key=lambda item: (-item["correction_count"], item["domain"]))
+
     def cleanup(self, *, user_id: uuid.UUID, account_id: uuid.UUID | None = None) -> dict:
         promotional = self.feed(user_id=user_id, account_id=account_id, category="promotional_bulk")
         notifications = self.feed(user_id=user_id, account_id=account_id, category="notification")
