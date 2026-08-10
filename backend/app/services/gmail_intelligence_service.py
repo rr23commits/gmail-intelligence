@@ -201,6 +201,7 @@ class GmailIntelligenceService:
         result = self._feed_item(classification, thread, account)
         result["explanation"] = classification.explanation
         result["classifier_version"] = classification.classifier_version
+        result["categories"] = sorted(CATEGORIES)
         result["gmail_url"] = f"https://mail.google.com/mail/u/0/#all/{urllib.parse.quote(thread.gmail_thread_id, safe='')}"
         result["messages"] = [
             {"from": message.from_address, "subject": message.subject, "body": message.body_text or message.snippet, "at": message.gmail_internal_date}
@@ -224,6 +225,8 @@ class GmailIntelligenceService:
             "total_analyzed": sum(counts.values()),
             "categories": counts,
             "needs_attention": counts["action_required"] + counts["important_keep"],
+            "opportunities": counts["opportunity"],
+            "important": counts["important_keep"],
             "low_priority": self._count_current(user_id=user_id, account_id=account_id, categories=safe, max_priority=34),
             "promotional": counts["promotional_bulk"],
             "notifications": counts["notification"],

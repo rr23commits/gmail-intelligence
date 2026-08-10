@@ -13,8 +13,8 @@ export async function getHealth(): Promise<{ status: string }> {
 export type IntelligenceReason = { signal: string; label: string; points: number };
 export type IntelligenceExplanation = { summary: string; category: { selected: string; tie_breaker: string }; reasons: IntelligenceReason[]; priority_breakdown: Record<string, number>; confidence: { value: number; factors: string[] }; classifier_version: string };
 export type IntelligenceItem = { id: string; account_id: string; account: string; subject: string; snippet: string; category: string; priority: number; confidence: number; summary: string; at: string; is_unread: boolean };
-export type IntelligenceDetail = IntelligenceItem & { explanation: IntelligenceExplanation; classifier_version: string; gmail_url: string; messages: { from: string; subject: string | null; body: string; at: string }[] };
-export type IntelligenceOverview = { total_analyzed: number; categories: Record<string, number>; needs_attention: number; low_priority: number; promotional: number; notifications: number };
+export type IntelligenceDetail = IntelligenceItem & { explanation: IntelligenceExplanation; classifier_version: string; gmail_url: string; categories: string[]; messages: { from: string; subject: string | null; body: string; at: string }[] };
+export type IntelligenceOverview = { total_analyzed: number; categories: Record<string, number>; needs_attention: number; opportunities: number; important: number; low_priority: number; promotional: number; notifications: number };
 export type CleanupGroup = { key: string; title: string; description: string; items: IntelligenceItem[] };
 export type Cleanup = { total_impact: number; groups: CleanupGroup[] };
 export type Account = { id: string; email: string; name: string | null; status: string; last_synced_at: string | null };
