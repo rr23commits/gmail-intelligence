@@ -1,0 +1,11 @@
+[
+  {"name":"hackathon_campaign","category":"promotional_bulk","subject":"Hackathon newsletter: register now","body":"Special offer for all subscribers. Register now and save.","from":"events@example.test","to":"list@example.test","metadata":{"is_list_delivery":true,"has_unsubscribe":true}},
+  {"name":"hackathon_opportunity","category":"opportunity","subject":"Hackathon invitation","body":"You are eligible for this student hackathon opportunity.","from":"team@example.test","to":"user@example.test","metadata":{}},
+  {"name":"hackathon_acceptance","category":"action_required","subject":"Hackathon acceptance","body":"You were selected. Please confirm your place by Friday.","from":"team@example.test","to":"user@example.test","metadata":{}},
+  {"name":"bank_statement","category":"important_keep","subject":"Your monthly statement","body":"Account statement. Billing period: June. Account balance and transaction date enclosed.","from":"bank@example.test","to":"user@example.test","metadata":{}},
+  {"name":"bank_otp","category":"otp_verification","subject":"Your verification code","body":"Your security code is 123456 and expires in 10 minutes.","from":"security@bank.example.test","to":"user@example.test","metadata":{}},
+  {"name":"bank_promotion","category":"promotional_bulk","subject":"A special card offer","body":"Newsletter: save with this limited offer. Shop now.","from":"offers@bank.example.test","to":"list@example.test","metadata":{"is_list_delivery":true,"has_unsubscribe":true}},
+  {"name":"personal_conversation","category":"personal_conversation","subject":"Dinner next week","body":"Hi, it was great speaking yesterday. Are you free next week?","from":"friend@example.test","to":"user@example.test","metadata":{}},
+  {"name":"social_notification","category":"notification","subject":"New comment on your post","body":"You have a new comment and a status update.","from":"noreply@social.example.test","to":"user@example.test","metadata":{}},
+  {"name":"unclear","category":"unclear","subject":"Update","body":"Please see the attached information.","from":"sender@example.test","to":"archive@example.test","metadata":{}}
+]

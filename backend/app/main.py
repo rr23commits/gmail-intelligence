@@ -11,8 +11,11 @@ from collections.abc import AsyncIterator
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.classification.feedback import validate_corrected_category
+from app.classification.m5 import CATEGORIES
 from app.core.config import get_settings
 from app.db.session import get_db_session
 from app.repositories.gmail_account_repository import GmailAccountRepository
@@ -22,9 +25,23 @@ from app.services.gmail_account_service import GmailAccountService
 from app.services.gmail_intelligence_service import (
     GmailApiError,
     GmailIntelligenceService,
+    SyncAlreadyRunning,
     _request,
 )
 from app.services.local_owner_service import LocalOwnerService
+
+
+class ClassificationCorrection(BaseModel):
+    corrected_category: str
+
+
+class ThreadAction(BaseModel):
+    action: str
+    thread_ids: list[uuid.UUID]
+
+
+class ReplyRequest(BaseModel):
+    body: str
 
 
 async def provision_local_owner() -> None:
@@ -104,8 +121,52 @@ def create_app(*, provision_owner_on_startup: bool = True) -> FastAPI:
             return result
         except LookupError as exc:
             raise HTTPException(404, str(exc)) from exc
+        except SyncAlreadyRunning as exc:
+            raise HTTPException(409, str(exc)) from exc
         except (GmailApiError, RuntimeError) as exc:
             session.rollback()
+            raise HTTPException(502, str(exc)) from exc
+
+    @app.post("/api/v1/accounts/{account_id}/threads/action", tags=["gmail"])
+    def thread_action(
+        account_id: uuid.UUID,
+        request: ThreadAction,
+        local_owner=Depends(owner),
+        session: Session = Depends(get_db_session),
+    ) -> dict:
+        if request.action not in {"archive", "delete", "mark_read", "mark_unread"} or not request.thread_ids:
+            raise HTTPException(422, "A supported action and at least one thread are required.")
+        try:
+            count = GmailIntelligenceService(session, MacOSKeychainTokenStore()).apply_thread_action(
+                user_id=local_owner.id,
+                account_id=account_id,
+                thread_ids=request.thread_ids,
+                action=request.action,
+            )
+            session.commit()
+            return {"updated": count}
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except (GmailApiError, RuntimeError) as exc:
+            session.rollback()
+            raise HTTPException(502, str(exc)) from exc
+
+    @app.post("/api/v1/accounts/{account_id}/threads/{thread_id}/reply", tags=["gmail"])
+    def reply_to_thread(
+        account_id: uuid.UUID,
+        thread_id: uuid.UUID,
+        request: ReplyRequest,
+        local_owner=Depends(owner),
+        session: Session = Depends(get_db_session),
+    ) -> dict:
+        if not request.body.strip():
+            raise HTTPException(422, "Reply body is required.")
+        try:
+            GmailIntelligenceService(session, MacOSKeychainTokenStore()).reply_to_thread(user_id=local_owner.id, account_id=account_id, thread_id=thread_id, body=request.body.strip())
+            return {"sent": True}
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except (GmailApiError, RuntimeError) as exc:
             raise HTTPException(502, str(exc)) from exc
 
     @app.delete("/api/v1/accounts/{account_id}", status_code=204, tags=["gmail"])
@@ -118,14 +179,66 @@ def create_app(*, provision_owner_on_startup: bool = True) -> FastAPI:
         session.commit()
 
     @app.get("/api/v1/intelligence", tags=["intelligence"])
-    def intelligence(account_id: uuid.UUID | None = None, local_owner=Depends(owner), session: Session = Depends(get_db_session)) -> list[dict]:
-        return GmailIntelligenceService(session).feed(user_id=local_owner.id, account_id=account_id)
+    def intelligence(
+        account_id: uuid.UUID | None = None,
+        category: str | None = None,
+        review: bool = False,
+        local_owner=Depends(owner),
+        session: Session = Depends(get_db_session),
+    ) -> list[dict]:
+        if category is not None and category not in CATEGORIES:
+            raise HTTPException(422, "category must be a canonical M5 category.")
+        if category is not None and review:
+            raise HTTPException(422, "review is a priority view and cannot be combined with category.")
+        return GmailIntelligenceService(session).feed(
+            user_id=local_owner.id,
+            account_id=account_id,
+            category=category,
+            review=review,
+        )
 
-    @app.get("/api/v1/intelligence/{thread_id}", tags=["intelligence"])
+    @app.get("/api/v1/intelligence/{thread_id:uuid}", tags=["intelligence"])
     def intelligence_detail(thread_id: uuid.UUID, local_owner=Depends(owner), session: Session = Depends(get_db_session)) -> dict:
         result = GmailIntelligenceService(session).detail(user_id=local_owner.id, thread_id=thread_id)
         if result is None:
             raise HTTPException(404, "Intelligence item not found.")
+        return result
+
+    @app.get("/api/v1/intelligence/overview", tags=["intelligence"])
+    def intelligence_overview(
+        account_id: uuid.UUID | None = None,
+        local_owner=Depends(owner),
+        session: Session = Depends(get_db_session),
+    ) -> dict:
+        return GmailIntelligenceService(session).overview(user_id=local_owner.id, account_id=account_id)
+
+    @app.get("/api/v1/intelligence/cleanup", tags=["intelligence"])
+    def intelligence_cleanup(
+        account_id: uuid.UUID | None = None,
+        local_owner=Depends(owner),
+        session: Session = Depends(get_db_session),
+    ) -> dict:
+        return GmailIntelligenceService(session).cleanup(user_id=local_owner.id, account_id=account_id)
+
+    @app.post("/api/v1/intelligence/{thread_id}/classification-feedback", tags=["intelligence"])
+    def classification_feedback(
+        thread_id: uuid.UUID,
+        correction: ClassificationCorrection,
+        local_owner=Depends(owner),
+        session: Session = Depends(get_db_session),
+    ) -> dict:
+        try:
+            validate_corrected_category(correction.corrected_category)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        result = GmailIntelligenceService(session).correct_classification(
+            user_id=local_owner.id,
+            thread_id=thread_id,
+            corrected_category=correction.corrected_category,
+        )
+        if result is None:
+            raise HTTPException(404, "Intelligence item not found.")
+        session.commit()
         return result
 
     @app.get("/api/v1/dashboard", tags=["intelligence"])
@@ -139,6 +252,8 @@ def create_app(*, provision_owner_on_startup: bool = True) -> FastAPI:
 app = create_app()
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
+GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
 
 def _sign_state(user_id: str) -> str:
@@ -154,7 +269,7 @@ def _gmail_authorization_url(user_id: str) -> str:
             "client_id": settings.google_oauth_client_id,
             "redirect_uri": settings.google_oauth_redirect_uri,
             "response_type": "code",
-            "scope": GMAIL_READONLY_SCOPE,
+            "scope": f"{GMAIL_READONLY_SCOPE} {GMAIL_MODIFY_SCOPE} {GMAIL_SEND_SCOPE}",
             "access_type": "offline",
             "include_granted_scopes": "true",
             "prompt": "consent",

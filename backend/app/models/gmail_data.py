@@ -97,6 +97,7 @@ class GmailMessage(Base):
     snippet: Mapped[str | None] = mapped_column(Text, nullable=True)
     body_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     label_ids: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)
+    delivery_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
     has_attachments: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -111,6 +112,8 @@ class Classification(Base):
 
     __tablename__ = "classifications"
     __table_args__ = (
+        CheckConstraint("priority_score BETWEEN 0 AND 100", name="ck_classifications_priority_range"),
+        CheckConstraint("confidence BETWEEN 0 AND 1", name="ck_classifications_confidence_range"),
         ForeignKeyConstraint(
             ["gmail_account_id", "user_id"],
             ["gmail_accounts.id", "gmail_accounts.user_id"],
@@ -198,6 +201,51 @@ class FeedbackEvent(Base):
     feedback_type: Mapped[str] = mapped_column(String(64), nullable=False)
     previous_value: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     new_value: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ClassificationFeedback(Base):
+    """A user's explicit correction of a thread classification."""
+
+    __tablename__ = "classification_feedback"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["gmail_account_id", "user_id"],
+            ["gmail_accounts.id", "gmail_accounts.user_id"],
+            name="fk_classification_feedback_account_owner",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["thread_id", "gmail_account_id", "user_id"],
+            ["gmail_threads.id", "gmail_threads.gmail_account_id", "gmail_threads.user_id"],
+            name="fk_classification_feedback_thread_owner",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["message_id", "thread_id", "gmail_account_id", "user_id"],
+            ["gmail_messages.id", "gmail_messages.thread_id", "gmail_messages.gmail_account_id", "gmail_messages.user_id"],
+            name="fk_classification_feedback_message_thread_owner",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "user_id", "thread_id", "original_category", "corrected_category",
+            name="uq_classification_feedback_thread_correction",
+        ),
+        Index("ix_classification_feedback_sender", "user_id", "gmail_account_id", "sender_domain"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    gmail_account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    thread_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    message_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    original_category: Mapped[str] = mapped_column(String(64), nullable=False)
+    corrected_category: Mapped[str] = mapped_column(String(64), nullable=False)
+    classifier_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    sender_address: Mapped[str] = mapped_column(String(320), nullable=False)
+    sender_domain: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

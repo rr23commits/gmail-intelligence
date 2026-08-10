@@ -2,37 +2,51 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 from datetime import UTC, datetime
+from email.utils import parseaddr
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
+from app.classification.feedback import (
+    FEEDBACK_CLASSIFIER_VERSION,
+    FeedbackSignal,
+    apply_feedback,
+    user_correction,
+)
+from app.classification.m5 import (
+    CATEGORIES,
+    M5_1_CLASSIFIER_VERSION,
+    ClassificationDecision,
+    ThreadSnapshot,
+    classify_thread_m5_1,
+)
 from app.models.gmail_account import GmailAccount, GmailSyncState
-from app.models.gmail_data import Classification, GmailMessage, GmailThread, Recommendation, SyncRun
+from app.models.gmail_data import (
+    Classification,
+    ClassificationFeedback,
+    GmailMessage,
+    GmailThread,
+    SyncRun,
+)
 from app.security.token_store import TokenStore
 
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
+logger = logging.getLogger(__name__)
 
 
 class GmailApiError(RuntimeError):
     pass
 
 
-def classify(subject: str, body: str) -> tuple[str, int, str]:
-    """Small deterministic first-pass classifier; its result is persisted as intelligence."""
-    text = f"{subject} {body}".lower()
-    if any(word in text for word in ("deadline", "due", "assignment", "exam")):
-        return "Action required", 92, "This email contains a deadline or task that needs attention."
-    if any(word in text for word in ("meeting", "schedule", "calendar", "invite")):
-        return "Schedule", 78, "This email appears to need scheduling attention."
-    if any(word in text for word in ("invoice", "receipt", "payment", "bill")):
-        return "Finance", 72, "This email relates to a payment or financial record."
-    return "FYI", 35, "This email is useful context but has no detected urgent action."
+class SyncAlreadyRunning(RuntimeError):
+    """This account already has a live synchronization run."""
 
 
 class GmailIntelligenceService:
@@ -42,19 +56,63 @@ class GmailIntelligenceService:
 
     def sync(self, *, user_id: uuid.UUID, account_id: uuid.UUID) -> dict[str, int]:
         account = self._account(user_id, account_id)
+        acquired = self._acquire_sync_lock(account.id)
+        if not acquired:
+            raise SyncAlreadyRunning("A Gmail sync is already running for this account.")
+        self._recover_stale_runs(user_id=user_id, account_id=account.id)
+        active = self.session.scalar(
+            select(SyncRun).where(
+                SyncRun.user_id == user_id,
+                SyncRun.gmail_account_id == account.id,
+                SyncRun.status == "running",
+            )
+        )
+        if active is not None:
+            self._release_sync_lock(account.id)
+            raise SyncAlreadyRunning("A Gmail sync is already running for this account.")
         run = SyncRun(user_id=user_id, gmail_account_id=account.id, mode="manual", status="running")
         self.session.add(run)
+        self.session.flush()
+        logger.info("Gmail sync started account=%s run=%s", account.id, run.id)
         try:
             if self.token_store is None:
                 raise RuntimeError("No token store is configured.")
             token = self.token_store.get_refresh_token(gmail_account_id=account.id)
             access_token = self._refresh_access_token(token)
             profile = self._get("/profile", access_token)
-            items = self._get("/messages?maxResults=50", access_token).get("messages", [])
             imported = 0
-            for item in items:
-                message = self._get(f"/messages/{item['id']}?format=full", access_token)
-                imported += self._save_message(user_id, account, message)
+            examined = 0
+            page_token: str | None = None
+            while True:
+                path = "/messages?maxResults=100"
+                if page_token:
+                    path += f"&pageToken={urllib.parse.quote(page_token)}"
+                page = self._get(path, access_token)
+                items = page.get("messages", [])
+                examined += len(items)
+                logger.info("Gmail sync page account=%s run=%s page_messages=%s examined=%s", account.id, run.id, len(items), examined)
+                known = set(
+                    self.session.scalars(
+                        select(GmailMessage.gmail_message_id)
+                        .join(Classification, Classification.thread_id == GmailMessage.thread_id)
+                        .where(
+                            GmailMessage.gmail_account_id == account.id,
+                            GmailMessage.gmail_message_id.in_([item["id"] for item in items]),
+                            Classification.is_current,
+                            Classification.classifier_version.in_((M5_1_CLASSIFIER_VERSION, FEEDBACK_CLASSIFIER_VERSION)),
+                        )
+                    )
+                ) if items else set()
+                for item in items:
+                    if item["id"] not in known:
+                        message = self._get(f"/messages/{item['id']}?format=full", access_token)
+                        imported += self._save_message(user_id, account, message)
+                run.messages_examined, run.messages_imported = examined, imported
+                self.session.commit()
+                logger.info("Gmail sync checkpoint account=%s run=%s examined=%s imported=%s", account.id, run.id, examined, imported)
+                page_token = page.get("nextPageToken")
+                if not page_token:
+                    break
             now = datetime.now(UTC)
             account.last_successful_sync_at = now
             state = self.session.get(GmailSyncState, account.id)
@@ -66,23 +124,68 @@ class GmailIntelligenceService:
             state.last_error_code = None
             state.last_error_at = None
             run.status, run.completed_at = "completed", now
-            run.messages_examined, run.messages_imported = len(items), imported
-            return {"messages_examined": len(items), "messages_imported": imported}
+            run.messages_examined, run.messages_imported = examined, imported
+            logger.info("Gmail sync completed account=%s run=%s examined=%s imported=%s", account.id, run.id, examined, imported)
+            return {"messages_examined": examined, "messages_imported": imported}
         except Exception as exc:
             run.status, run.completed_at, run.error_code = "failed", datetime.now(UTC), type(exc).__name__
             run.error_summary = str(exc)[:500]
             raise
+        finally:
+            self._release_sync_lock(account.id)
 
-    def feed(self, *, user_id: uuid.UUID, account_id: uuid.UUID | None = None) -> list[dict]:
+    def _acquire_sync_lock(self, account_id: uuid.UUID) -> bool:
+        return bool(
+            self.session.scalar(
+                select(func.pg_try_advisory_lock(func.hashtextextended(str(account_id), 0)))
+            )
+        )
+
+    def _release_sync_lock(self, account_id: uuid.UUID) -> None:
+        self.session.scalar(select(func.pg_advisory_unlock(func.hashtextextended(str(account_id), 0))))
+
+    def _recover_stale_runs(self, *, user_id: uuid.UUID, account_id: uuid.UUID) -> int:
+        stale = list(
+            self.session.scalars(
+                select(SyncRun).where(
+                    SyncRun.user_id == user_id,
+                    SyncRun.gmail_account_id == account_id,
+                    SyncRun.status == "running",
+                )
+            )
+        )
+        now = datetime.now(UTC)
+        for run in stale:
+            run.status = "failed"
+            run.completed_at = now
+            run.error_code = "interrupted"
+            run.error_summary = "Recovered as abandoned after the sync process stopped."
+        if stale:
+            self.session.flush()
+            logger.warning("Recovered %s abandoned Gmail sync run(s) account=%s", len(stale), account_id)
+        return len(stale)
+
+    def feed(
+        self,
+        *,
+        user_id: uuid.UUID,
+        account_id: uuid.UUID | None = None,
+        category: str | None = None,
+        review: bool = False,
+    ) -> list[dict]:
         statement = (
             select(Classification, GmailThread, GmailAccount)
             .join(GmailThread, Classification.thread_id == GmailThread.id)
             .join(GmailAccount, Classification.gmail_account_id == GmailAccount.id)
-            .where(Classification.user_id == user_id, Classification.is_current)
+            .where(Classification.user_id == user_id, Classification.is_current, GmailThread.is_in_inbox)
             .order_by(Classification.priority_score.desc(), GmailThread.latest_message_at.desc())
         )
         if account_id:
             statement = statement.where(Classification.gmail_account_id == account_id)
+        if category:
+            statement = statement.where(Classification.category == category)
+        if review:
+            statement = statement.where(Classification.priority_score.between(35, 79))
         return [self._feed_item(classification, thread, account) for classification, thread, account in self.session.execute(statement)]
 
     def detail(self, *, user_id: uuid.UUID, thread_id: uuid.UUID) -> dict | None:
@@ -96,11 +199,176 @@ class GmailIntelligenceService:
             return None
         classification, thread, account = row
         result = self._feed_item(classification, thread, account)
+        result["explanation"] = classification.explanation
+        result["classifier_version"] = classification.classifier_version
+        result["gmail_url"] = f"https://mail.google.com/mail/u/0/#all/{urllib.parse.quote(thread.gmail_thread_id, safe='')}"
         result["messages"] = [
             {"from": message.from_address, "subject": message.subject, "body": message.body_text or message.snippet, "at": message.gmail_internal_date}
             for message in self.session.scalars(select(GmailMessage).where(GmailMessage.user_id == user_id, GmailMessage.thread_id == thread.id).order_by(GmailMessage.gmail_internal_date))
         ]
         return result
+
+    def overview(self, *, user_id: uuid.UUID, account_id: uuid.UUID | None = None) -> dict:
+        statement = (
+            select(Classification.category, func.count())
+            .join(GmailThread, Classification.thread_id == GmailThread.id)
+            .where(Classification.user_id == user_id, Classification.is_current, GmailThread.is_in_inbox)
+            .group_by(Classification.category)
+        )
+        if account_id:
+            statement = statement.where(Classification.gmail_account_id == account_id)
+        counts = {category: 0 for category in CATEGORIES}
+        counts.update(dict(self.session.execute(statement).all()))
+        safe = ("notification", "promotional_bulk", "personal_conversation", "unclear")
+        return {
+            "total_analyzed": sum(counts.values()),
+            "categories": counts,
+            "needs_attention": counts["action_required"] + counts["important_keep"],
+            "low_priority": self._count_current(user_id=user_id, account_id=account_id, categories=safe, max_priority=34),
+            "promotional": counts["promotional_bulk"],
+            "notifications": counts["notification"],
+        }
+
+    def cleanup(self, *, user_id: uuid.UUID, account_id: uuid.UUID | None = None) -> dict:
+        promotional = self.feed(user_id=user_id, account_id=account_id, category="promotional_bulk")
+        notifications = self.feed(user_id=user_id, account_id=account_id, category="notification")
+        low_priority = self._safe_low_priority(user_id=user_id, account_id=account_id)
+        total_ids = {item["id"] for item in promotional + notifications + low_priority}
+        return {
+            "total_impact": len(total_ids),
+            "groups": [
+                {"key": "promotional", "title": "Promotional emails", "description": "Mostly newsletters, campaigns and offers.", "items": promotional},
+                {"key": "notifications", "title": "Notifications", "description": "Mostly automated activity updates and alerts.", "items": notifications},
+                {"key": "low_priority", "title": "Low-priority", "description": "Safe to review; action, important and verification emails are excluded.", "items": low_priority},
+            ],
+        }
+
+    def apply_thread_action(
+        self, *, user_id: uuid.UUID, account_id: uuid.UUID, thread_ids: list[uuid.UUID], action: str
+    ) -> int:
+        account = self._account(user_id, account_id)
+        threads = list(self.session.scalars(select(GmailThread).where(GmailThread.user_id == user_id, GmailThread.gmail_account_id == account_id, GmailThread.id.in_(thread_ids))))
+        if len(threads) != len(set(thread_ids)):
+            raise LookupError("One or more selected emails do not belong to this Gmail account.")
+        token = self.token_store.get_refresh_token(gmail_account_id=account.id) if self.token_store else None
+        if not token:
+            raise RuntimeError("No token store is configured.")
+        access_token = self._refresh_access_token(token)
+        for thread in threads:
+            if action == "delete":
+                self._post(f"/threads/{thread.gmail_thread_id}/trash", access_token)
+                thread.is_in_inbox = False
+            else:
+                labels = {"archive": {"removeLabelIds": ["INBOX"]}, "mark_read": {"removeLabelIds": ["UNREAD"]}, "mark_unread": {"addLabelIds": ["UNREAD"]}}[action]
+                self._post(f"/threads/{thread.gmail_thread_id}/modify", access_token, labels)
+                if action == "archive":
+                    thread.is_in_inbox = False
+                else:
+                    thread.is_unread = action == "mark_unread"
+            for message in self.session.scalars(select(GmailMessage).where(GmailMessage.thread_id == thread.id)):
+                labels = set(message.label_ids)
+                if action in {"archive", "delete"}:
+                    labels.discard("INBOX")
+                elif action == "mark_read":
+                    labels.discard("UNREAD")
+                else:
+                    labels.add("UNREAD")
+                message.label_ids = list(labels)
+        return len(threads)
+
+    def reply_to_thread(self, *, user_id: uuid.UUID, account_id: uuid.UUID, thread_id: uuid.UUID, body: str) -> None:
+        account = self._account(user_id, account_id)
+        thread = self.session.scalar(select(GmailThread).where(GmailThread.id == thread_id, GmailThread.user_id == user_id, GmailThread.gmail_account_id == account_id))
+        if thread is None:
+            raise LookupError("Email does not belong to this Gmail account.")
+        message = self.session.scalar(select(GmailMessage).where(GmailMessage.thread_id == thread.id).order_by(GmailMessage.gmail_internal_date.desc()))
+        if message is None:
+            raise LookupError("Email has no message to reply to.")
+        token = self.token_store.get_refresh_token(gmail_account_id=account.id) if self.token_store else None
+        if not token:
+            raise RuntimeError("No token store is configured.")
+        recipient = parseaddr(message.from_address)[1]
+        subject = message.subject or thread.subject_normalized or ""
+        raw = base64.urlsafe_b64encode(f"To: {recipient}\r\nSubject: Re: {subject}\r\n\r\n{body}".encode()).decode().rstrip("=")
+        self._post("/messages/send", self._refresh_access_token(token), {"raw": raw, "threadId": thread.gmail_thread_id})
+
+    def correct_classification(
+        self, *, user_id: uuid.UUID, thread_id: uuid.UUID, corrected_category: str
+    ) -> dict | None:
+        row = self.session.execute(
+            select(Classification, GmailThread, GmailAccount)
+            .join(GmailThread, Classification.thread_id == GmailThread.id)
+            .join(GmailAccount, Classification.gmail_account_id == GmailAccount.id)
+            .where(Classification.user_id == user_id, Classification.thread_id == thread_id, Classification.is_current)
+        ).one_or_none()
+        if row is None:
+            return None
+        current, thread, account = row
+        original = self.session.scalar(
+            select(Classification)
+            .where(
+                Classification.thread_id == thread.id,
+                Classification.classifier_version == M5_1_CLASSIFIER_VERSION,
+            )
+            .order_by(Classification.created_at.desc())
+        ) or current
+        if corrected_category == current.category:
+            return self._feed_item(current, thread, account)
+        duplicate = self.session.scalar(
+            select(ClassificationFeedback).where(
+                ClassificationFeedback.user_id == user_id,
+                ClassificationFeedback.thread_id == thread.id,
+                ClassificationFeedback.original_category == original.category,
+                ClassificationFeedback.corrected_category == corrected_category,
+            )
+        )
+        if duplicate is not None:
+            return self._feed_item(current, thread, account)
+        message = self.session.scalar(
+            select(GmailMessage)
+            .where(GmailMessage.thread_id == thread.id, GmailMessage.user_id == user_id)
+            .order_by(GmailMessage.gmail_internal_date.desc())
+        )
+        sender_address = message.from_address if message else "Unknown"
+        self.session.add(
+            ClassificationFeedback(
+                user_id=user_id,
+                gmail_account_id=account.id,
+                thread_id=thread.id,
+                message_id=message.id if message else None,
+                original_category=original.category,
+                corrected_category=corrected_category,
+                classifier_version=original.classifier_version,
+                sender_address=sender_address,
+                sender_domain=_sender_domain(sender_address),
+            )
+        )
+        decision = user_correction(
+            ClassificationDecision(
+                category=original.category,
+                priority_score=original.priority_score,
+                confidence=float(original.confidence),
+                explanation=original.explanation,
+            ),
+            category=corrected_category,
+        )
+        current.is_current = False
+        self.session.flush()
+        replacement = Classification(
+            user_id=user_id,
+            gmail_account_id=account.id,
+            thread_id=thread.id,
+            category=decision.category,
+            priority_score=decision.priority_score,
+            confidence=decision.confidence,
+            explanation=decision.explanation,
+            source="local_feedback",
+            classifier_version=FEEDBACK_CLASSIFIER_VERSION,
+            is_current=True,
+        )
+        self.session.add(replacement)
+        self.session.flush()
+        return self._feed_item(replacement, thread, account)
 
     def _save_message(self, user_id: uuid.UUID, account: GmailAccount, raw: dict) -> int:
         headers = {h["name"].lower(): h["value"] for h in raw.get("payload", {}).get("headers", [])}
@@ -117,17 +385,94 @@ class GmailIntelligenceService:
         if existing:
             return 0
         body = _body(raw.get("payload", {}))
-        self.session.add(GmailMessage(user_id=user_id, gmail_account_id=account.id, thread_id=thread.id, gmail_message_id=raw["id"], gmail_internal_date=internal_date, from_address=headers.get("from", "Unknown"), to_addresses={"to": headers.get("to", "")}, cc_addresses={"cc": headers["cc"]} if headers.get("cc") else None, subject=headers.get("subject"), snippet=raw.get("snippet"), body_text=body, label_ids=raw.get("labelIds", []), has_attachments=False))
+        delivery_metadata = _delivery_metadata(headers)
+        self.session.add(GmailMessage(user_id=user_id, gmail_account_id=account.id, thread_id=thread.id, gmail_message_id=raw["id"], gmail_internal_date=internal_date, from_address=headers.get("from", "Unknown"), to_addresses={"to": headers.get("to", "")}, cc_addresses={"cc": headers["cc"]} if headers.get("cc") else None, subject=headers.get("subject"), snippet=raw.get("snippet"), body_text=body, label_ids=raw.get("labelIds", []), delivery_metadata=delivery_metadata, has_attachments=False))
         thread.message_count += 1
-        category, score, explanation = classify(headers.get("subject", ""), body)
-        current = self.session.scalar(select(Classification).where(Classification.thread_id == thread.id, Classification.is_current))
+        decision = classify_thread_m5_1(
+            ThreadSnapshot(
+                subject=headers.get("subject", ""),
+                body=body,
+                from_address=headers.get("from", "Unknown"),
+                to_addresses=headers.get("to", ""),
+                cc_addresses=headers.get("cc", ""),
+                account_email=account.gmail_email,
+                label_ids=tuple(raw.get("labelIds", [])),
+                latest_message_at=internal_date,
+                message_count=thread.message_count,
+                is_in_inbox=thread.is_in_inbox,
+                is_unread=thread.is_unread,
+                delivery_metadata=delivery_metadata,
+            )
+        )
+        current = self.session.scalar(
+            select(Classification)
+            .where(
+                Classification.thread_id == thread.id,
+                Classification.user_id == user_id,
+                Classification.gmail_account_id == account.id,
+                Classification.is_current,
+            )
+            .with_for_update()
+        )
         if current:
             current.is_current = False
-        classification = Classification(user_id=user_id, gmail_account_id=account.id, thread_id=thread.id, category=category, priority_score=score, confidence=0.8, explanation={"summary": explanation}, source="rules", classifier_version="m3-rules", is_current=True)
-        self.session.add(classification)
-        if score >= 70:
-            self.session.add(Recommendation(user_id=user_id, gmail_account_id=account.id, thread_id=thread.id, classification_id=classification.id, recommendation_type="review", rationale={"summary": explanation}))
+            self.session.flush()
+        base = Classification(user_id=user_id, gmail_account_id=account.id, thread_id=thread.id, category=decision.category, priority_score=decision.priority_score, confidence=decision.confidence, explanation=decision.explanation, source="local_deterministic", classifier_version=M5_1_CLASSIFIER_VERSION, is_current=True)
+        adjusted = self._apply_feedback(
+            user_id=user_id,
+            account_id=account.id,
+            sender_address=headers.get("from", "Unknown"),
+            decision=decision,
+        )
+        if adjusted.category == decision.category:
+            self.session.add(base)
+        else:
+            base.is_current = False
+            self.session.add(base)
+            self.session.add(Classification(user_id=user_id, gmail_account_id=account.id, thread_id=thread.id, category=adjusted.category, priority_score=adjusted.priority_score, confidence=adjusted.confidence, explanation=adjusted.explanation, source="local_feedback", classifier_version=FEEDBACK_CLASSIFIER_VERSION, is_current=True))
+        # SessionLocal disables autoflush; make the one-current-row handoff
+        # visible before the next message in the same thread is processed.
+        self.session.flush()
         return 1
+
+    def _apply_feedback(
+        self, *, user_id: uuid.UUID, account_id: uuid.UUID, sender_address: str, decision: ClassificationDecision
+    ) -> ClassificationDecision:
+        sender_domain = _sender_domain(sender_address)
+        feedback = [
+            FeedbackSignal(
+                sender_domain=item.sender_domain,
+                original_category=item.original_category,
+                corrected_category=item.corrected_category,
+            )
+            for item in self.session.scalars(
+                select(ClassificationFeedback).where(
+                    ClassificationFeedback.user_id == user_id,
+                    ClassificationFeedback.gmail_account_id == account_id,
+                    ClassificationFeedback.sender_domain == sender_domain,
+                    ClassificationFeedback.original_category == decision.category,
+                )
+            )
+        ]
+        return apply_feedback(decision, sender_domain=sender_domain, feedback=feedback)
+
+    def _count_current(self, *, user_id: uuid.UUID, account_id: uuid.UUID | None, categories: tuple[str, ...], max_priority: int) -> int:
+        statement = select(func.count()).select_from(Classification).join(GmailThread, Classification.thread_id == GmailThread.id).where(Classification.user_id == user_id, Classification.is_current, GmailThread.is_in_inbox, Classification.category.in_(categories), Classification.priority_score <= max_priority)
+        if account_id:
+            statement = statement.where(Classification.gmail_account_id == account_id)
+        return self.session.scalar(statement) or 0
+
+    def _safe_low_priority(self, *, user_id: uuid.UUID, account_id: uuid.UUID | None) -> list[dict]:
+        statement = (
+            select(Classification, GmailThread, GmailAccount)
+            .join(GmailThread, Classification.thread_id == GmailThread.id)
+            .join(GmailAccount, Classification.gmail_account_id == GmailAccount.id)
+            .where(Classification.user_id == user_id, Classification.is_current, GmailThread.is_in_inbox, Classification.priority_score <= 34, Classification.category.not_in(("action_required", "important_keep", "otp_verification")))
+            .order_by(Classification.priority_score.asc(), GmailThread.latest_message_at.desc())
+        )
+        if account_id:
+            statement = statement.where(Classification.gmail_account_id == account_id)
+        return [self._feed_item(classification, thread, account) for classification, thread, account in self.session.execute(statement)]
 
     def _thread_for_message(
         self,
@@ -175,9 +520,12 @@ class GmailIntelligenceService:
     def _get(self, path: str, access_token: str) -> dict:
         return _request(f"{GMAIL_API}{path}", headers={"Authorization": f"Bearer {access_token}"})
 
+    def _post(self, path: str, access_token: str, payload: dict | None = None) -> dict:
+        return _request(f"{GMAIL_API}{path}", data=json.dumps(payload or {}).encode(), headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"})
+
     @staticmethod
     def _feed_item(classification: Classification, thread: GmailThread, account: GmailAccount) -> dict:
-        return {"id": str(thread.id), "account_id": str(account.id), "account": account.gmail_email, "subject": thread.subject_normalized or "Untitled email", "snippet": thread.snippet or "", "category": classification.category, "priority": classification.priority_score, "summary": classification.explanation.get("summary", ""), "at": thread.latest_message_at}
+        return {"id": str(thread.id), "account_id": str(account.id), "account": account.gmail_email, "subject": thread.subject_normalized or "Untitled email", "snippet": thread.snippet or "", "category": classification.category, "priority": classification.priority_score, "confidence": float(classification.confidence), "summary": classification.explanation.get("summary", ""), "at": thread.latest_message_at, "is_unread": thread.is_unread}
 
 
 def _request(url: str, *, data: bytes | None = None, headers: dict[str, str] | None = None) -> dict:
@@ -195,3 +543,19 @@ def _body(payload: dict) -> str:
         if part.get("mimeType") == "text/plain":
             return _body(part)
     return ""
+
+
+def _delivery_metadata(headers: dict[str, str]) -> dict[str, object]:
+    """Persist only delivery facts needed by the local classifier, never raw headers."""
+    precedence = headers.get("precedence", "").lower()
+    return {
+        "is_list_delivery": bool(headers.get("list-id") or headers.get("list-unsubscribe")),
+        "has_unsubscribe": bool(headers.get("list-unsubscribe")),
+        "bulk_precedence": precedence in {"bulk", "list", "junk"},
+        "reply_to_present": bool(headers.get("reply-to")),
+    }
+
+
+def _sender_domain(address: str) -> str:
+    """Normalize the sender domain without retaining extra header information."""
+    return parseaddr(address)[1].rsplit("@", 1)[-1].lower() if "@" in parseaddr(address)[1] else ""

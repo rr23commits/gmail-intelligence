@@ -1,6 +1,11 @@
 from urllib.parse import parse_qs, urlparse
 
-from app.main import GMAIL_READONLY_SCOPE, _gmail_authorization_url
+from app.main import (
+    GMAIL_MODIFY_SCOPE,
+    GMAIL_READONLY_SCOPE,
+    GMAIL_SEND_SCOPE,
+    _gmail_authorization_url,
+)
 
 
 def test_gmail_authorization_request_escalates_an_existing_openid_grant(monkeypatch) -> None:
@@ -12,6 +17,6 @@ def test_gmail_authorization_request_escalates_an_existing_openid_grant(monkeypa
 
     query = parse_qs(urlparse(_gmail_authorization_url("00000000-0000-0000-0000-000000000000")).query)
 
-    assert query["scope"] == [GMAIL_READONLY_SCOPE]
+    assert query["scope"] == [f"{GMAIL_READONLY_SCOPE} {GMAIL_MODIFY_SCOPE} {GMAIL_SEND_SCOPE}"]
     assert query["include_granted_scopes"] == ["true"]
     assert query["prompt"] == ["consent"]

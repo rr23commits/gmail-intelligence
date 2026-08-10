@@ -5,7 +5,7 @@ import { getAccounts, getDashboard, type Account, type IntelligenceItem } from "
 import { Shell } from "./shell";
 
 const groups = ["People & conversations", "Important activity", "Needs your attention"];
-function groupFor(item: IntelligenceItem) { return item.priority >= 70 ? groups[2] : item.category === "FYI" ? groups[1] : groups[0]; }
+function groupFor(item: IntelligenceItem) { return item.category === "action_required" || item.priority >= 80 ? groups[2] : item.category === "personal_conversation" ? groups[0] : groups[1]; }
 
 export default function DashboardPage() {
   const [items, setItems] = useState<IntelligenceItem[]>([]); const [accounts, setAccounts] = useState<Account[]>([]);

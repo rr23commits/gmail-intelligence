@@ -24,6 +24,9 @@ Intelligence, and Accounts views. PostgreSQL stores account metadata and the
 messages/intelligence required by those views; it does not store OAuth tokens
 or OAuth credential metadata.
 
+The current deterministic classifier is M5.1 (`m5.1-local`).  Each thread
+retains its earlier M3 and M5.0 classifications as non-current history.
+
 ## Local setup
 
 1. Copy `.env.example` to `.env` and replace the placeholder secrets.
@@ -33,12 +36,13 @@ or OAuth credential metadata.
    docker compose -f infra/docker-compose.yml up -d
    ```
 
-3. Create and activate a Python 3.12 virtual environment, then install backend
-   dependencies:
+3. Create and activate a Python virtual environment, then install backend
+   dependencies. Recreating it with `python3` also repairs a stale virtual
+   environment after a Homebrew Python upgrade:
 
    ```sh
    cd backend
-   python -m venv .venv
+   python3 -m venv --clear .venv
    source .venv/bin/activate
    pip install -e '.[dev]'
    ```
@@ -49,20 +53,17 @@ or OAuth credential metadata.
    alembic upgrade head
    ```
 
-5. Install and start the frontend:
+5. Install the frontend:
 
    ```sh
    cd ../frontend
    npm install
-   npm run dev
    ```
 
-6. In another terminal, start the backend:
+6. From the repository root, start both services:
 
    ```sh
-   cd backend
-   source .venv/bin/activate
-   uvicorn app.main:app --reload
+   make dev
    ```
 
 The frontend is available at `http://localhost:3000`; the backend health check
