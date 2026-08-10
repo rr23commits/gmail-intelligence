@@ -39,6 +39,9 @@ from app.security.token_store import TokenStore
 
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
 logger = logging.getLogger(__name__)
+DO = "do"
+CONSIDER = "consider"
+CLEAN_UP = "clean_up"
 
 
 class GmailApiError(RuntimeError):
@@ -230,21 +233,63 @@ class GmailIntelligenceService:
             "low_priority": self._count_current(user_id=user_id, account_id=account_id, categories=safe, max_priority=34),
             "promotional": counts["promotional_bulk"],
             "notifications": counts["notification"],
+            "decisions": self._decision_counts(user_id=user_id, account_id=account_id),
         }
+
+    def sender_groups(self, *, user_id: uuid.UUID, account_id: uuid.UUID | None = None) -> list[dict]:
+        groups: dict[str, dict] = {}
+        for classification, _, _, message in self._classified_thread_rows(user_id=user_id, account_id=account_id):
+            sender = _sender_domain(message.from_address)
+            if not sender:
+                continue
+            group = groups.setdefault(
+                sender,
+                {"sender": sender, "total": 0, "categories": {category: 0 for category in CATEGORIES}, "decisions": {DO: 0, CONSIDER: 0, CLEAN_UP: 0}},
+            )
+            group["total"] += 1
+            group["categories"][classification.category] += 1
+            group["decisions"][_decision_bucket(classification.category, classification.priority_score)] += 1
+        return sorted(groups.values(), key=lambda group: (-group["total"], group["sender"]))
 
     def cleanup(self, *, user_id: uuid.UUID, account_id: uuid.UUID | None = None) -> dict:
         promotional = self.feed(user_id=user_id, account_id=account_id, category="promotional_bulk")
         notifications = self.feed(user_id=user_id, account_id=account_id, category="notification")
         low_priority = self._safe_low_priority(user_id=user_id, account_id=account_id)
-        total_ids = {item["id"] for item in promotional + notifications + low_priority}
+        candidates = {item["id"]: item for item in promotional + notifications + low_priority}
+        senders = {str(thread.id): _sender_domain(message.from_address) for _, thread, _, message in self._classified_thread_rows(user_id=user_id, account_id=account_id)}
+        groups: dict[tuple[str, str], list[dict]] = {}
+        for item in candidates.values():
+            sender = senders.get(item["id"], "")
+            groups.setdefault((sender or "unknown-sender", item["category"]), []).append(item)
         return {
-            "total_impact": len(total_ids),
+            "total_impact": len(candidates),
             "groups": [
-                {"key": "promotional", "title": "Promotional emails", "description": "Mostly newsletters, campaigns and offers.", "items": promotional},
-                {"key": "notifications", "title": "Notifications", "description": "Mostly automated activity updates and alerts.", "items": notifications},
-                {"key": "low_priority", "title": "Low-priority", "description": "Safe to review; action, important and verification emails are excluded.", "items": low_priority},
+                {"key": f"{sender}:{category}", "title": sender, "description": category.replace("_", " "), "items": items}
+                for (sender, category), items in sorted(groups.items())
             ],
         }
+
+    def _classified_thread_rows(self, *, user_id: uuid.UUID, account_id: uuid.UUID | None) -> list[tuple]:
+        statement = (
+            select(Classification, GmailThread, GmailAccount, GmailMessage)
+            .join(GmailThread, Classification.thread_id == GmailThread.id)
+            .join(GmailAccount, Classification.gmail_account_id == GmailAccount.id)
+            .join(GmailMessage, GmailMessage.thread_id == GmailThread.id)
+            .where(Classification.user_id == user_id, Classification.is_current, GmailThread.is_in_inbox)
+            .order_by(GmailThread.id, GmailMessage.gmail_internal_date.desc())
+        )
+        if account_id:
+            statement = statement.where(Classification.gmail_account_id == account_id)
+        latest: dict[uuid.UUID, tuple] = {}
+        for row in self.session.execute(statement):
+            latest.setdefault(row[1].id, row)
+        return list(latest.values())
+
+    def _decision_counts(self, *, user_id: uuid.UUID, account_id: uuid.UUID | None) -> dict[str, int]:
+        counts = {DO: 0, CONSIDER: 0, CLEAN_UP: 0}
+        for classification, _, _, _ in self._classified_thread_rows(user_id=user_id, account_id=account_id):
+            counts[_decision_bucket(classification.category, classification.priority_score)] += 1
+        return counts
 
     def apply_thread_action(
         self, *, user_id: uuid.UUID, account_id: uuid.UUID, thread_ids: list[uuid.UUID], action: str
@@ -528,7 +573,7 @@ class GmailIntelligenceService:
 
     @staticmethod
     def _feed_item(classification: Classification, thread: GmailThread, account: GmailAccount) -> dict:
-        return {"id": str(thread.id), "account_id": str(account.id), "account": account.gmail_email, "subject": thread.subject_normalized or "Untitled email", "snippet": thread.snippet or "", "category": classification.category, "priority": classification.priority_score, "confidence": float(classification.confidence), "summary": classification.explanation.get("summary", ""), "at": thread.latest_message_at, "is_unread": thread.is_unread}
+        return {"id": str(thread.id), "account_id": str(account.id), "account": account.gmail_email, "subject": thread.subject_normalized or "Untitled email", "snippet": thread.snippet or "", "category": classification.category, "decision": _decision_bucket(classification.category, classification.priority_score), "priority": classification.priority_score, "confidence": float(classification.confidence), "summary": classification.explanation.get("summary", ""), "at": thread.latest_message_at, "is_unread": thread.is_unread}
 
 
 def _request(url: str, *, data: bytes | None = None, headers: dict[str, str] | None = None) -> dict:
@@ -562,3 +607,11 @@ def _delivery_metadata(headers: dict[str, str]) -> dict[str, object]:
 def _sender_domain(address: str) -> str:
     """Normalize the sender domain without retaining extra header information."""
     return parseaddr(address)[1].rsplit("@", 1)[-1].lower() if "@" in parseaddr(address)[1] else ""
+
+
+def _decision_bucket(category: str, priority_score: int) -> str:
+    if category == "action_required" or (category == "important_keep" and priority_score >= 80):
+        return DO
+    if category in {"opportunity", "important_keep", "personal_conversation"}:
+        return CONSIDER
+    return CLEAN_UP

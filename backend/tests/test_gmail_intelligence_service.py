@@ -1,10 +1,18 @@
 import uuid
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from app.classification.m5 import ThreadSnapshot, classify_thread
 from app.models.gmail_account import GmailAccount
 from app.models.gmail_data import Classification, GmailMessage, GmailThread, SyncRun
-from app.services.gmail_intelligence_service import GmailIntelligenceService, SyncAlreadyRunning
+from app.services.gmail_intelligence_service import (
+    CLEAN_UP,
+    CONSIDER,
+    DO,
+    GmailIntelligenceService,
+    SyncAlreadyRunning,
+    _decision_bucket,
+)
 
 
 def test_classifier_separates_action_category_from_priority() -> None:
@@ -173,3 +181,94 @@ def test_interrupted_sync_runs_are_recovered() -> None:
     assert recovered == 1
     assert run.status == "failed"
     assert run.error_code == "interrupted"
+
+
+def test_m2_overview_and_decision_mapping_are_data_backed() -> None:
+    class Result:
+        def all(self):
+            return [("action_required", 2), ("notification", 3)]
+
+    class OverviewService(GmailIntelligenceService):
+        def _count_current(self, **_kwargs):
+            return 4
+
+        def _decision_counts(self, **_kwargs):
+            return {DO: 2, CONSIDER: 1, CLEAN_UP: 3}
+
+    class Session:
+        def execute(self, _statement):
+            return Result()
+
+    overview = OverviewService(Session()).overview(user_id=uuid.uuid4())
+
+    assert overview["total_analyzed"] == 5
+    assert overview["categories"]["action_required"] == 2
+    assert overview["categories"]["notification"] == 3
+    assert overview["decisions"] == {DO: 2, CONSIDER: 1, CLEAN_UP: 3}
+    assert _decision_bucket("action_required", 1) == DO
+    assert _decision_bucket("important_keep", 80) == DO
+    assert _decision_bucket("opportunity", 1) == CONSIDER
+    assert _decision_bucket("notification", 99) == CLEAN_UP
+
+
+def test_sender_groups_preserve_each_current_category() -> None:
+    rows = [
+        (SimpleNamespace(category="notification", priority_score=20), None, None, SimpleNamespace(from_address="LinkedIn <updates@linkedin.com>")),
+        (SimpleNamespace(category="opportunity", priority_score=50), None, None, SimpleNamespace(from_address="jobs@linkedin.com")),
+        (SimpleNamespace(category="action_required", priority_score=90), None, None, SimpleNamespace(from_address="alerts@other.test")),
+    ]
+
+    class GroupService(GmailIntelligenceService):
+        def _classified_thread_rows(self, **_kwargs):
+            return rows
+
+    groups = GroupService(object()).sender_groups(user_id=uuid.uuid4())
+
+    linkedin = next(group for group in groups if group["sender"] == "linkedin.com")
+    assert linkedin["total"] == 2
+    assert linkedin["categories"]["notification"] == 1
+    assert linkedin["categories"]["opportunity"] == 1
+    assert linkedin["decisions"][CONSIDER] == 1
+
+
+def test_cleanup_groups_candidates_by_sender_and_category() -> None:
+    promotional = {"id": str(uuid.uuid4()), "category": "promotional_bulk", "account_id": "account-a"}
+    notification = {"id": str(uuid.uuid4()), "category": "notification", "account_id": "account-b"}
+
+    class CleanupService(GmailIntelligenceService):
+        def feed(self, **kwargs):
+            return [promotional] if kwargs["category"] == "promotional_bulk" else [notification]
+
+        def _safe_low_priority(self, **_kwargs):
+            return [promotional]
+
+        def _classified_thread_rows(self, **_kwargs):
+            return [
+                (None, SimpleNamespace(id=uuid.UUID(promotional["id"])), None, SimpleNamespace(from_address="news@store.test")),
+                (None, SimpleNamespace(id=uuid.UUID(notification["id"])), None, SimpleNamespace(from_address="alerts@updates.test")),
+            ]
+
+    cleanup = CleanupService(object()).cleanup(user_id=uuid.uuid4())
+
+    assert cleanup["total_impact"] == 2
+    assert {group["key"] for group in cleanup["groups"]} == {"store.test:promotional_bulk", "updates.test:notification"}
+    assert all(len(group["items"]) == 1 for group in cleanup["groups"])
+
+
+def test_thread_actions_reject_threads_outside_selected_account() -> None:
+    account = GmailAccount(id=uuid.uuid4(), user_id=uuid.uuid4(), gmail_email="user@example.com", gmail_email_normalized="user@example.com", gmail_profile_id="profile")
+
+    class OwnershipService(GmailIntelligenceService):
+        def _account(self, *_args):
+            return account
+
+    class Session:
+        def scalars(self, _statement):
+            return []
+
+    try:
+        OwnershipService(Session()).apply_thread_action(user_id=account.user_id, account_id=account.id, thread_ids=[uuid.uuid4()], action="delete")
+    except LookupError:
+        pass
+    else:
+        raise AssertionError("an out-of-account thread action was accepted")

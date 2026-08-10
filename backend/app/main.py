@@ -212,6 +212,14 @@ def create_app(*, provision_owner_on_startup: bool = True) -> FastAPI:
     ) -> dict:
         return GmailIntelligenceService(session).overview(user_id=local_owner.id, account_id=account_id)
 
+    @app.get("/api/v1/intelligence/senders", tags=["intelligence"])
+    def intelligence_senders(
+        account_id: uuid.UUID | None = None,
+        local_owner=Depends(owner),
+        session: Session = Depends(get_db_session),
+    ) -> list[dict]:
+        return GmailIntelligenceService(session).sender_groups(user_id=local_owner.id, account_id=account_id)
+
     @app.get("/api/v1/intelligence/cleanup", tags=["intelligence"])
     def intelligence_cleanup(
         account_id: uuid.UUID | None = None,
