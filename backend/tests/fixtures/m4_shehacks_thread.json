@@ -1,0 +1,23 @@
+[
+  {
+    "id": "application-submitted",
+    "at": "2026-08-01T09:00:00+00:00",
+    "from": "Applicant <user@example.test>",
+    "subject": "SheHacks — Application submitted",
+    "body": "My SheHacks application has been submitted."
+  },
+  {
+    "id": "application-received",
+    "at": "2026-08-01T09:05:00+00:00",
+    "from": "SheHacks <hello@shehacks.example.test>",
+    "subject": "SheHacks — Application received",
+    "body": "We have received your application."
+  },
+  {
+    "id": "first-round-cleared",
+    "at": "2026-08-05T10:00:00+00:00",
+    "from": "SheHacks <hello@shehacks.example.test>",
+    "subject": "SheHacks — First Round Cleared",
+    "body": "Congratulations. You cleared the first round. Deadline: 18 August 2026."
+  }
+]

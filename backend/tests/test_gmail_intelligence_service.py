@@ -1,5 +1,7 @@
+import json
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 from app.classification.m5 import ThreadSnapshot, classify_thread
@@ -18,6 +20,8 @@ from app.services.gmail_intelligence_service import (
     GmailIntelligenceService,
     SyncAlreadyRunning,
     _decision_bucket,
+    _display_body,
+    _related_conversation_messages,
 )
 
 
@@ -27,6 +31,187 @@ def test_classifier_separates_action_category_from_priority() -> None:
     assert decision.category == "action_required"
     assert decision.priority_score > 0
     assert decision.explanation["category"]["selected"] == "action_required"
+
+
+def test_detail_reconstructs_a_gmail_thread_in_chronological_order() -> None:
+    user_id, account_id, thread_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "m4_shehacks_thread.json").read_text())
+    thread = GmailThread(
+        id=thread_id,
+        user_id=user_id,
+        gmail_account_id=account_id,
+        gmail_thread_id="shehacks-thread",
+        latest_message_at=datetime.fromisoformat(fixture[-1]["at"]),
+        is_unread=True,
+    )
+    account = GmailAccount(
+        id=account_id,
+        user_id=user_id,
+        gmail_email="user@example.test",
+        gmail_email_normalized="user@example.test",
+        gmail_profile_id="profile",
+    )
+    classification = Classification(
+        user_id=user_id,
+        gmail_account_id=account_id,
+        thread_id=thread_id,
+        category="opportunity",
+        priority_score=50,
+        confidence=0.9,
+        explanation={
+            "summary": "SheHacks update.",
+            "reasons": [{"signal": "requested_action", "label": "A confirmation is explicitly requested"}],
+        },
+        source="local_deterministic",
+        classifier_version="m5.1-local",
+        is_current=True,
+    )
+    messages = [
+        GmailMessage(
+            id=uuid.uuid4(),
+            user_id=user_id,
+            gmail_account_id=account_id,
+            thread_id=thread_id,
+            gmail_message_id=item["id"],
+            gmail_internal_date=datetime.fromisoformat(item["at"]),
+            from_address=item["from"],
+            to_addresses={"to": "user@example.test"},
+            subject=item["subject"],
+            snippet=item["body"],
+            body_text=item["body"],
+            label_ids=["INBOX"],
+        )
+        for item in fixture
+    ]
+
+    class Result:
+        def one_or_none(self):
+            return classification, thread, account
+
+    class Session:
+        def execute(self, _statement):
+            return Result()
+
+        def scalars(self, _statement):
+            return messages
+
+    detail = GmailIntelligenceService(Session()).detail(user_id=user_id, thread_id=thread_id)  # type: ignore[arg-type]
+
+    assert [message["subject"] for message in detail["messages"]] == [item["subject"] for item in fixture]
+    assert [message["is_current"] for message in detail["messages"]] == [False, False, True]
+    assert detail["thread_intelligence"] == {
+        "state": "3 messages in this Gmail conversation · unread",
+        "latest_event": "SheHacks — First Round Cleared",
+        "open_action": "A confirmation is explicitly requested",
+        "explicit_deadline": "Deadline: 18 August 2026",
+    }
+    opened = GmailIntelligenceService(Session()).detail(  # type: ignore[arg-type]
+        user_id=user_id, thread_id=thread_id, message_id=messages[0].id
+    )
+    assert [message["is_current"] for message in opened["messages"]] == [True, False, False]
+    assert opened["messages"][0]["thread_id"] == str(thread_id)
+
+
+def test_related_conversation_requires_same_domain_and_meaningful_subject_overlap() -> None:
+    user_id, account_id, native_thread_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+
+    def message(thread_id: uuid.UUID, subject: str, sender: str) -> GmailMessage:
+        return GmailMessage(
+            id=uuid.uuid4(), user_id=user_id, gmail_account_id=account_id, thread_id=thread_id,
+            gmail_message_id=str(uuid.uuid4()), gmail_internal_date=datetime.now(UTC), from_address=sender,
+            to_addresses={"to": "user@example.test"}, subject=subject, snippet="", body_text="", label_ids=["INBOX"],
+        )
+
+    native = message(native_thread_id, "Urgent Action Required | Logitech x Aspire For Her", "Logitech <team@logitech.test>")
+    related = message(uuid.uuid4(), "Participation Confirmation Pending | Women Who Master by Logitech x Aspire For Her", "Logitech <team@logitech.test>")
+    unrelated = message(uuid.uuid4(), "Your Logitech order receipt", "Logitech <team@logitech.test>")
+
+    assert _related_conversation_messages([native], [related, unrelated]) == [related]
+
+
+def test_display_body_renders_html_email_without_raw_markup_or_whitespace_noise() -> None:
+    rendered = _display_body(
+        "```html\n<style>.email { margin-left: 900px }</style><p>Hello <b>there</b>.</p>\n"
+        "<p>Read the <a href=\"https://example.test/details\">details</a>.</p>\n````\n"
+    )
+
+    assert rendered == '<p>Hello <b>there</b>.</p>\n<p>Read the <a href="https://example.test/details" target="_blank" rel="noreferrer">details</a>.</p>'
+    assert "```" not in rendered
+    assert "style" not in rendered
+    assert _display_body("Hello\nPlain text") == "<p>Hello Plain text</p>"
+
+
+def test_sync_hydrates_every_message_in_a_gmail_thread() -> None:
+    user_id, account_id = uuid.uuid4(), uuid.uuid4()
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "m4_shehacks_thread.json").read_text())
+    account = GmailAccount(
+        id=account_id,
+        user_id=user_id,
+        gmail_email="user@example.test",
+        gmail_email_normalized="user@example.test",
+        gmail_profile_id="profile",
+    )
+    saved: list[dict] = []
+
+    class Session:
+        def scalar(self, _statement):
+            return None
+
+        def scalars(self, _statement):
+            return []
+
+        def add(self, _value):
+            pass
+
+        def flush(self):
+            pass
+
+        def commit(self):
+            pass
+
+        def get(self, _model, _id):
+            return None
+
+    class Service(GmailIntelligenceService):
+        def _account(self, _user_id, _account_id):
+            return account
+
+        def _acquire_sync_lock(self, _account_id):
+            return True
+
+        def _release_sync_lock(self, _account_id):
+            pass
+
+        def _refresh_access_token(self, _token):
+            return "access-token"
+
+        def _get(self, path, _access_token):
+            if path == "/profile":
+                return {"historyId": "1"}
+            if path == "/messages?maxResults=100":
+                return {"messages": [{"id": fixture[-1]["id"], "threadId": "shehacks-thread"}]}
+            if path == "/threads/shehacks-thread?format=full":
+                return {
+                    "messages": [
+                        {
+                            "id": item["id"],
+                            "threadId": "shehacks-thread",
+                            "internalDate": str(int(datetime.fromisoformat(item["at"]).timestamp() * 1000)),
+                        }
+                        for item in fixture
+                    ]
+                }
+            raise AssertionError(path)
+
+        def _save_message(self, _user_id, _account, raw):
+            saved.append(raw)
+            return 1
+
+    service = Service(Session(), token_store=SimpleNamespace(get_refresh_token=lambda **_: "refresh-token"))
+    result = service.sync(user_id=user_id, account_id=account_id)
+
+    assert result == {"messages_examined": 1, "messages_imported": 3}
+    assert [message["id"] for message in saved] == [item["id"] for item in fixture]
 
 
 class ExistingThreadSession:

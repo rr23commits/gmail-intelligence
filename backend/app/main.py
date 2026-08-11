@@ -205,8 +205,15 @@ def create_app(*, provision_owner_on_startup: bool = True) -> FastAPI:
         )
 
     @app.get("/api/v1/intelligence/{thread_id:uuid}", tags=["intelligence"])
-    def intelligence_detail(thread_id: uuid.UUID, local_owner=Depends(owner), session: Session = Depends(get_db_session)) -> dict:
-        result = GmailIntelligenceService(session).detail(user_id=local_owner.id, thread_id=thread_id)
+    def intelligence_detail(
+        thread_id: uuid.UUID,
+        message_id: uuid.UUID | None = None,
+        local_owner=Depends(owner),
+        session: Session = Depends(get_db_session),
+    ) -> dict:
+        result = GmailIntelligenceService(session).detail(
+            user_id=local_owner.id, thread_id=thread_id, message_id=message_id
+        )
         if result is None:
             raise HTTPException(404, "Intelligence item not found.")
         return result

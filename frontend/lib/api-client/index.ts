@@ -13,7 +13,7 @@ export async function getHealth(): Promise<{ status: string }> {
 export type IntelligenceReason = { signal: string; label: string; points: number };
 export type IntelligenceExplanation = { summary: string; category: { selected: string; tie_breaker: string }; reasons: IntelligenceReason[]; priority_breakdown: Record<string, number>; confidence: { value: number; factors: string[] }; classifier_version: string };
 export type IntelligenceItem = { id: string; account_id: string; account: string; subject: string; snippet: string; category: string; decision: string; priority: number; confidence: number; summary: string; at: string; is_unread: boolean };
-export type IntelligenceDetail = IntelligenceItem & { explanation: IntelligenceExplanation; classifier_version: string; gmail_url: string; categories: string[]; messages: { from: string; subject: string | null; body: string; at: string }[] };
+export type IntelligenceDetail = IntelligenceItem & { explanation: IntelligenceExplanation; classifier_version: string; gmail_url: string; categories: string[]; messages: { id: string; thread_id: string; from: string; subject: string | null; body: string; at: string; is_current: boolean }[]; thread_intelligence: { state: string; latest_event: string | null; open_action: string | null; explicit_deadline: string | null } };
 export type IntelligenceOverview = { total_analyzed: number; categories: Record<string, number>; needs_attention: number; opportunities: number; important: number; low_priority: number; promotional: number; notifications: number; decisions: Record<string, number> };
 export type SenderGroup = { sender: string; total: number; categories: Record<string, number>; decisions: Record<string, number> };
 export type LearnedPreference = { domain: string; original_category: string; learned_category: string; correction_count: number };
@@ -32,7 +32,7 @@ export const getIntelligence = (filter: IntelligenceFilter = {}) => {
   const query = params.size ? `?${params}` : "";
   return api<IntelligenceItem[]>(`/api/v1/intelligence${query}`);
 };
-export const getIntelligenceDetail = (id: string) => api<IntelligenceDetail>(`/api/v1/intelligence/${id}`);
+export const getIntelligenceDetail = (id: string, messageId?: string) => api<IntelligenceDetail>(`/api/v1/intelligence/${id}${messageId ? `?message_id=${messageId}` : ""}`);
 export const getIntelligenceOverview = (accountId?: string) => api<IntelligenceOverview>(`/api/v1/intelligence/overview${accountId ? `?account_id=${accountId}` : ""}`);
 export const getSenderGroups = (accountId?: string) => api<SenderGroup[]>(`/api/v1/intelligence/senders${accountId ? `?account_id=${accountId}` : ""}`);
 export const getLearnedPreferences = (accountId: string) => api<LearnedPreference[]>(`/api/v1/intelligence/learned-preferences?account_id=${accountId}`);
