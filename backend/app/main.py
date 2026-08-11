@@ -47,6 +47,10 @@ class ReplyRequest(BaseModel):
     body: str
 
 
+class TaskStatusUpdate(BaseModel):
+    status: str
+
+
 async def provision_local_owner() -> None:
     """Ensure the local V1 owner exists after the database schema is migrated."""
 
@@ -216,6 +220,27 @@ def create_app(*, provision_owner_on_startup: bool = True) -> FastAPI:
         )
         if result is None:
             raise HTTPException(404, "Intelligence item not found.")
+        return result
+
+    @app.post("/api/v1/accounts/{account_id}/tasks/{task_id}/status", tags=["intelligence"])
+    def task_status(
+        account_id: uuid.UUID,
+        task_id: uuid.UUID,
+        update: TaskStatusUpdate,
+        local_owner=Depends(owner),
+        session: Session = Depends(get_db_session),
+    ) -> dict:
+        if update.status not in {"open", "done", "snoozed"}:
+            raise HTTPException(422, "status must be open, done, or snoozed.")
+        result = GmailIntelligenceService(session).update_task_status(
+            user_id=local_owner.id,
+            account_id=account_id,
+            task_id=task_id,
+            status=update.status,
+        )
+        if result is None:
+            raise HTTPException(404, "Task not found.")
+        session.commit()
         return result
 
     @app.get("/api/v1/intelligence/overview", tags=["intelligence"])

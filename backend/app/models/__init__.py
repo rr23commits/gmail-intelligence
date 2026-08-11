@@ -2,6 +2,7 @@
 
 from app.models.gmail_account import GmailAccount, GmailSyncState
 from app.models.gmail_data import (
+    ActionTask,
     Classification,
     ClassificationFeedback,
     FeedbackEvent,
@@ -13,6 +14,7 @@ from app.models.gmail_data import (
 from app.models.user import User
 
 __all__ = [
+    "ActionTask",
     "Classification",
     "ClassificationFeedback",
     "FeedbackEvent",

@@ -34,6 +34,7 @@ from app.classification.m5 import (
 )
 from app.models.gmail_account import GmailAccount, GmailSyncState
 from app.models.gmail_data import (
+    ActionTask,
     Classification,
     ClassificationFeedback,
     GmailMessage,
@@ -88,37 +89,21 @@ class GmailIntelligenceService:
             token = self.token_store.get_refresh_token(gmail_account_id=account.id)
             access_token = self._refresh_access_token(token)
             profile = self._get("/profile", access_token)
-            imported = 0
-            examined = 0
-            page_token: str | None = None
-            synced_thread_ids: set[str] = set()
-            while True:
-                path = "/messages?maxResults=100"
-                if page_token:
-                    path += f"&pageToken={urllib.parse.quote(page_token)}"
-                page = self._get(path, access_token)
-                items = page.get("messages", [])
-                examined += len(items)
-                logger.info("Gmail sync page account=%s run=%s page_messages=%s examined=%s", account.id, run.id, len(items), examined)
-                for item in items:
-                    gmail_thread_id = item.get("threadId")
-                    if not gmail_thread_id or gmail_thread_id in synced_thread_ids:
-                        continue
-                    synced_thread_ids.add(gmail_thread_id)
-                    gmail_thread = self._get(
-                        f"/threads/{urllib.parse.quote(gmail_thread_id, safe='')}?format=full", access_token
+            state = self.session.get(GmailSyncState, account.id)
+            if state and state.history_id:
+                try:
+                    examined, imported = self._sync_history(
+                        user_id=user_id, account=account, access_token=access_token, history_id=state.history_id
                     )
-                    for message in sorted(gmail_thread.get("messages", []), key=lambda value: int(value["internalDate"])):
-                        imported += self._save_message(user_id, account, message)
-                run.messages_examined, run.messages_imported = examined, imported
-                self.session.commit()
-                logger.info("Gmail sync checkpoint account=%s run=%s examined=%s imported=%s", account.id, run.id, examined, imported)
-                page_token = page.get("nextPageToken")
-                if not page_token:
-                    break
+                except GmailApiError as exc:
+                    if "(404)" not in str(exc):
+                        raise
+                    examined, imported = self._sync_full(user_id=user_id, account=account, access_token=access_token)
+            else:
+                examined, imported = self._sync_full(user_id=user_id, account=account, access_token=access_token)
+            self._backfill_action_tasks(user_id=user_id, account_id=account.id)
             now = datetime.now(UTC)
             account.last_successful_sync_at = now
-            state = self.session.get(GmailSyncState, account.id)
             if state is None:
                 state = GmailSyncState(gmail_account_id=account.id, user_id=user_id)
                 self.session.add(state)
@@ -136,6 +121,59 @@ class GmailIntelligenceService:
             raise
         finally:
             self._release_sync_lock(account.id)
+
+    def _sync_full(self, *, user_id: uuid.UUID, account: GmailAccount, access_token: str) -> tuple[int, int]:
+        imported = examined = 0
+        page_token: str | None = None
+        synced_thread_ids: set[str] = set()
+        while True:
+            path = "/messages?maxResults=100"
+            if page_token:
+                path += f"&pageToken={urllib.parse.quote(page_token)}"
+            page = self._get(path, access_token)
+            items = page.get("messages", [])
+            examined += len(items)
+            for item in items:
+                gmail_thread_id = item.get("threadId")
+                if gmail_thread_id and gmail_thread_id not in synced_thread_ids:
+                    synced_thread_ids.add(gmail_thread_id)
+                    imported += self._sync_gmail_thread(user_id=user_id, account=account, access_token=access_token, gmail_thread_id=gmail_thread_id)
+            page_token = page.get("nextPageToken")
+            if not page_token:
+                return examined, imported
+
+    def _sync_history(self, *, user_id: uuid.UUID, account: GmailAccount, access_token: str, history_id: str) -> tuple[int, int]:
+        imported = examined = 0
+        page_token: str | None = None
+        synced_thread_ids: set[str] = set()
+        while True:
+            path = f"/history?startHistoryId={urllib.parse.quote(history_id)}&historyTypes=messageAdded&maxResults=500"
+            if page_token:
+                path += f"&pageToken={urllib.parse.quote(page_token)}"
+            page = self._get(path, access_token)
+            messages = [item["message"] for record in page.get("history", []) for item in record.get("messagesAdded", [])]
+            examined += len(messages)
+            for message in messages:
+                gmail_thread_id = message.get("threadId")
+                if gmail_thread_id and gmail_thread_id not in synced_thread_ids:
+                    synced_thread_ids.add(gmail_thread_id)
+                    imported += self._sync_gmail_thread(user_id=user_id, account=account, access_token=access_token, gmail_thread_id=gmail_thread_id)
+            page_token = page.get("nextPageToken")
+            if not page_token:
+                return examined, imported
+
+    def _sync_gmail_thread(self, *, user_id: uuid.UUID, account: GmailAccount, access_token: str, gmail_thread_id: str) -> int:
+        gmail_thread = self._get(f"/threads/{urllib.parse.quote(gmail_thread_id, safe='')}?format=full", access_token)
+        return sum(self._save_message(user_id, account, message) for message in sorted(gmail_thread.get("messages", []), key=lambda value: int(value["internalDate"])))
+
+    def _backfill_action_tasks(self, *, user_id: uuid.UUID, account_id: uuid.UUID) -> None:
+        messages = self.session.scalars(
+            select(GmailMessage)
+            .outerjoin(ActionTask, ActionTask.message_id == GmailMessage.id)
+            .where(GmailMessage.user_id == user_id, GmailMessage.gmail_account_id == account_id, ActionTask.id.is_(None))
+        )
+        for message in messages:
+            self._ensure_action_task(user_id=user_id, account_id=account_id, message=message, is_new=True)
 
     def _acquire_sync_lock(self, account_id: uuid.UUID) -> bool:
         return bool(
@@ -251,6 +289,16 @@ class GmailIntelligenceService:
         result["thread_intelligence"] = _thread_intelligence(
             messages=messages, explanation=classification.explanation, is_unread=thread.is_unread
         )
+        task = self.session.scalar(
+            select(ActionTask)
+            .where(
+                ActionTask.user_id == user_id,
+                ActionTask.gmail_account_id == account.id,
+                ActionTask.thread_id == thread.id,
+            )
+            .order_by(ActionTask.created_at.desc())
+        )
+        result["task"] = _task_item(task) if task else None
         return result
 
     def overview(self, *, user_id: uuid.UUID, account_id: uuid.UUID | None = None) -> dict:
@@ -511,10 +559,13 @@ class GmailIntelligenceService:
         thread.message_count, thread.is_in_inbox, thread.is_unread = 1, "INBOX" in raw.get("labelIds", []), "UNREAD" in raw.get("labelIds", [])
         existing = self.session.scalar(select(GmailMessage).where(GmailMessage.gmail_account_id == account.id, GmailMessage.gmail_message_id == raw["id"]))
         if existing:
+            self._ensure_action_task(user_id=user_id, account_id=account.id, message=existing)
             return 0
         body = _body(raw.get("payload", {}))
         delivery_metadata = _delivery_metadata(headers)
-        self.session.add(GmailMessage(user_id=user_id, gmail_account_id=account.id, thread_id=thread.id, gmail_message_id=raw["id"], gmail_internal_date=internal_date, from_address=headers.get("from", "Unknown"), to_addresses={"to": headers.get("to", "")}, cc_addresses={"cc": headers["cc"]} if headers.get("cc") else None, subject=headers.get("subject"), snippet=raw.get("snippet"), body_text=body, label_ids=raw.get("labelIds", []), delivery_metadata=delivery_metadata, has_attachments=False))
+        message = GmailMessage(id=uuid.uuid4(), user_id=user_id, gmail_account_id=account.id, thread_id=thread.id, gmail_message_id=raw["id"], gmail_internal_date=internal_date, from_address=headers.get("from", "Unknown"), to_addresses={"to": headers.get("to", "")}, cc_addresses={"cc": headers["cc"]} if headers.get("cc") else None, subject=headers.get("subject"), snippet=raw.get("snippet"), body_text=body, label_ids=raw.get("labelIds", []), delivery_metadata=delivery_metadata, has_attachments=False)
+        self.session.add(message)
+        self._ensure_action_task(user_id=user_id, account_id=account.id, message=message, is_new=True)
         thread.message_count += 1
         decision = classify_thread_m5_1(
             ThreadSnapshot(
@@ -562,6 +613,46 @@ class GmailIntelligenceService:
         # visible before the next message in the same thread is processed.
         self.session.flush()
         return 1
+
+    def _ensure_action_task(
+        self, *, user_id: uuid.UUID, account_id: uuid.UUID, message: GmailMessage, is_new: bool = False
+    ) -> None:
+        if not (title := _action_title(f"{message.subject or ''}\n{message.body_text or message.snippet or ''}")):
+            return
+        if not is_new and self.session.scalar(
+            select(ActionTask.id).where(
+                ActionTask.message_id == message.id,
+                ActionTask.user_id == user_id,
+                ActionTask.gmail_account_id == account_id,
+            )
+        ):
+            return
+        self.session.add(
+            ActionTask(
+                user_id=user_id,
+                gmail_account_id=account_id,
+                thread_id=message.thread_id,
+                message_id=message.id,
+                title=title,
+                deadline=_explicit_deadline([message]),
+                status="open",
+            )
+        )
+
+    def update_task_status(
+        self, *, user_id: uuid.UUID, account_id: uuid.UUID, task_id: uuid.UUID, status: str
+    ) -> dict | None:
+        task = self.session.scalar(
+            select(ActionTask).where(
+                ActionTask.id == task_id,
+                ActionTask.user_id == user_id,
+                ActionTask.gmail_account_id == account_id,
+            )
+        )
+        if task is None:
+            return None
+        task.status = status
+        return _task_item(task)
 
     def _apply_feedback(
         self, *, user_id: uuid.UUID, account_id: uuid.UUID, sender_address: str, decision: ClassificationDecision
@@ -795,17 +886,37 @@ def _linkify(text: str) -> str:
     )
 
 
+_TASK_REQUESTS = (
+    re.compile(r"\b(?:please|kindly)\s+(?P<task>(?:send|reply|respond|confirm|approve|submit|complete|review|register|rsvp|fill out|upload|provide|attach)\b[^.!?\n|]{0,120})", re.IGNORECASE),
+    re.compile(r"\b(?:need|require)\s+you\s+to\s+(?P<task>(?:send|reply|respond|confirm|approve|submit|complete|review|register|rsvp|fill out|upload|provide|attach)\b[^.!?\n|]{0,120})", re.IGNORECASE),
+    re.compile(r"(?:^|[.!?\n|:]\s*)(?P<task>(?:send|reply|respond|confirm|approve|submit|complete|review|register|rsvp|fill out|upload|provide|attach)\b[^.!?\n|]{0,120})", re.IGNORECASE),
+)
+
+
+def _action_title(body: str) -> str | None:
+    text = re.sub(r"<(?:style|script)\b[^>]*>.*?</(?:style|script)>", " ", body, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"\n+", "\n", re.sub(r"[ \t]+", " ", re.sub(r"<[^>]+>", "\n", unescape(text)))).strip()
+    for pattern in _TASK_REQUESTS:
+        if match := pattern.search(text):
+            title = re.sub(r"\s+(?:by|before)\s+.+$", "", match["task"]).strip(" :.-")
+            return title[:1].upper() + title[1:]
+    return None
+
+
+def _task_item(task: ActionTask) -> dict:
+    return {
+        "id": str(task.id),
+        "title": task.title,
+        "deadline": task.deadline,
+        "status": task.status,
+        "source_thread_id": str(task.thread_id),
+        "source_message_id": str(task.message_id),
+    }
+
+
 def _thread_intelligence(*, messages: list[GmailMessage], explanation: dict, is_unread: bool) -> dict:
     latest = messages[-1] if messages else None
-    reasons = explanation.get("reasons", [])
-    action = next(
-        (
-            reason["label"]
-            for reason in reasons
-            if reason.get("signal") in {"requested_action", "confirmation_required"}
-        ),
-        None,
-    )
+    action = next((_action_title(f"{message.subject or ''}\n{message.body_text or message.snippet or ''}") for message in reversed(messages)), None)
     return {
         "state": f"{len(messages)} message{'s' if len(messages) != 1 else ''} in this Gmail conversation"
         + (" · unread" if is_unread else ""),

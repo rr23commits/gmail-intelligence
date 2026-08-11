@@ -4,6 +4,7 @@ from app.db.base import Base
 
 def test_expected_tables_are_registered() -> None:
     assert set(Base.metadata.tables) == {
+        "action_tasks",
         "classifications",
         "classification_feedback",
         "feedback_events",

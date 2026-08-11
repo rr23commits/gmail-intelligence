@@ -300,6 +300,50 @@ class Recommendation(Base):
     )
 
 
+class ActionTask(Base):
+    """A user-managed task derived from one explicit email request."""
+
+    __tablename__ = "action_tasks"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["gmail_account_id", "user_id"],
+            ["gmail_accounts.id", "gmail_accounts.user_id"],
+            name="fk_action_tasks_account_owner",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["thread_id", "gmail_account_id", "user_id"],
+            ["gmail_threads.id", "gmail_threads.gmail_account_id", "gmail_threads.user_id"],
+            name="fk_action_tasks_thread_owner",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["message_id", "thread_id", "gmail_account_id", "user_id"],
+            ["gmail_messages.id", "gmail_messages.thread_id", "gmail_messages.gmail_account_id", "gmail_messages.user_id"],
+            name="fk_action_tasks_message_thread_owner",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint("status IN ('open', 'done', 'snoozed')", name="ck_action_tasks_status"),
+        UniqueConstraint("message_id", name="uq_action_tasks_message"),
+        Index("ix_action_tasks_account_thread_status", "gmail_account_id", "thread_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    gmail_account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    thread_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    message_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    deadline: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="open")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class SyncRun(Base):
     """Operational history for one account-scoped synchronization attempt."""
 

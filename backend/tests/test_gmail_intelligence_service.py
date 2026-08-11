@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from app.classification.m5 import ThreadSnapshot, classify_thread
 from app.models.gmail_account import GmailAccount
 from app.models.gmail_data import (
+    ActionTask,
     Classification,
     ClassificationFeedback,
     GmailMessage,
@@ -19,6 +20,7 @@ from app.services.gmail_intelligence_service import (
     DO,
     GmailIntelligenceService,
     SyncAlreadyRunning,
+    _action_title,
     _decision_bucket,
     _display_body,
     _related_conversation_messages,
@@ -95,6 +97,9 @@ def test_detail_reconstructs_a_gmail_thread_in_chronological_order() -> None:
         def scalars(self, _statement):
             return messages
 
+        def scalar(self, _statement):
+            return None
+
     detail = GmailIntelligenceService(Session()).detail(user_id=user_id, thread_id=thread_id)  # type: ignore[arg-type]
 
     assert [message["subject"] for message in detail["messages"]] == [item["subject"] for item in fixture]
@@ -102,7 +107,7 @@ def test_detail_reconstructs_a_gmail_thread_in_chronological_order() -> None:
     assert detail["thread_intelligence"] == {
         "state": "3 messages in this Gmail conversation · unread",
         "latest_event": "SheHacks — First Round Cleared",
-        "open_action": "A confirmation is explicitly requested",
+        "open_action": None,
         "explicit_deadline": "Deadline: 18 August 2026",
     }
     opened = GmailIntelligenceService(Session()).detail(  # type: ignore[arg-type]
@@ -139,6 +144,122 @@ def test_display_body_renders_html_email_without_raw_markup_or_whitespace_noise(
     assert "```" not in rendered
     assert "style" not in rendered
     assert _display_body("Hello\nPlain text") == "<p>Hello Plain text</p>"
+
+
+def test_explicit_action_creates_an_open_task_with_its_deadline() -> None:
+    user_id, account_id, thread_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    thread = GmailThread(id=thread_id, user_id=user_id, gmail_account_id=account_id, gmail_thread_id="task", latest_message_at=datetime.now(UTC))
+    session = ExistingThreadSession(thread)
+    account = GmailAccount(id=account_id, user_id=user_id, gmail_email="user@example.test", gmail_email_normalized="user@example.test", gmail_profile_id="profile")
+    raw = {"id": "task-message", "threadId": "task", "internalDate": "0", "snippet": "Please send your availability for an interview by Friday.", "labelIds": ["INBOX"], "payload": {"body": {"data": "UGxlYXNlIHNlbmQgeW91ciBhdmFpbGFiaWxpdHkgZm9yIGFuIGludGVydmlldyBieSBGcmlkYXku"}, "headers": [{"name": "From", "value": "team@example.test"}, {"name": "To", "value": "user@example.test"}, {"name": "Subject", "value": "Interview"}]}}
+
+    GmailIntelligenceService(session)._save_message(user_id, account, raw)  # type: ignore[arg-type]
+
+    task = next(item for item in session.added if isinstance(item, ActionTask))
+    assert (task.title, task.status, task.deadline, task.thread_id) == ("Send your availability for an interview", "open", "by Friday", thread_id)
+
+
+def test_non_actionable_email_creates_no_task() -> None:
+    user_id, account_id, thread_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    thread = GmailThread(id=thread_id, user_id=user_id, gmail_account_id=account_id, gmail_thread_id="fyi", latest_message_at=datetime.now(UTC))
+    session = ExistingThreadSession(thread)
+    account = GmailAccount(id=account_id, user_id=user_id, gmail_email="user@example.test", gmail_email_normalized="user@example.test", gmail_profile_id="profile")
+    raw = {"id": "fyi-message", "threadId": "fyi", "internalDate": "0", "snippet": "Your monthly report is ready.", "labelIds": ["INBOX"], "payload": {"body": {"data": "WW91ciBtb250aGx5IHJlcG9ydCBpcyByZWFkeS4"}, "headers": [{"name": "From", "value": "team@example.test"}, {"name": "To", "value": "user@example.test"}, {"name": "Subject", "value": "Report"}]}}
+
+    GmailIntelligenceService(session)._save_message(user_id, account, raw)  # type: ignore[arg-type]
+
+    assert not any(isinstance(item, ActionTask) for item in session.added)
+
+
+def test_existing_actionable_email_is_backfilled_once() -> None:
+    user_id, account_id, thread_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    thread = GmailThread(id=thread_id, user_id=user_id, gmail_account_id=account_id, gmail_thread_id="existing", latest_message_at=datetime.now(UTC))
+    message = GmailMessage(id=uuid.uuid4(), user_id=user_id, gmail_account_id=account_id, thread_id=thread_id, gmail_message_id="existing-message", gmail_internal_date=datetime.now(UTC), from_address="team@example.test", to_addresses={"to": "user@example.test"}, subject="Participation", snippet="Please confirm your participation.", body_text="Please confirm your participation.", label_ids=["INBOX"])
+    account = GmailAccount(id=account_id, user_id=user_id, gmail_email="user@example.test", gmail_email_normalized="user@example.test", gmail_profile_id="profile")
+
+    class Session:
+        def __init__(self):
+            self.added: list[object] = []
+
+        def execute(self, _statement):
+            pass
+
+        def scalar(self, statement):
+            entity = statement.column_descriptions[0].get("entity")
+            if entity is GmailThread:
+                return thread
+            if entity is GmailMessage:
+                return message
+            return next((item for item in self.added if isinstance(item, ActionTask)), None)
+
+        def add(self, value):
+            self.added.append(value)
+
+    session = Session()
+    service = GmailIntelligenceService(session)  # type: ignore[arg-type]
+    raw = {"id": "existing-message", "threadId": "existing", "internalDate": "0", "snippet": message.snippet, "labelIds": ["INBOX"], "payload": {"headers": []}}
+
+    assert service._save_message(user_id, account, raw) == 0
+    assert service._save_message(user_id, account, raw) == 0
+    tasks = [item for item in session.added if isinstance(item, ActionTask)]
+    assert [(task.title, task.status) for task in tasks] == [("Confirm your participation", "open")]
+
+
+def test_existing_non_actionable_email_is_not_backfilled() -> None:
+    message = GmailMessage(id=uuid.uuid4(), user_id=uuid.uuid4(), gmail_account_id=uuid.uuid4(), thread_id=uuid.uuid4(), gmail_message_id="fyi", gmail_internal_date=datetime.now(UTC), from_address="team@example.test", to_addresses={"to": "user@example.test"}, subject="Report", snippet="Your report is ready.", body_text="Your report is ready.", label_ids=["INBOX"])
+
+    class Session:
+        def scalar(self, _statement):
+            return None
+
+        def add(self, _value):
+            raise AssertionError("non-actionable email created a task")
+
+    GmailIntelligenceService(Session())._ensure_action_task(  # type: ignore[arg-type]
+        user_id=message.user_id, account_id=message.gmail_account_id, message=message
+    )
+
+
+def test_clear_imperative_actions_create_tasks() -> None:
+    user_id, account_id, thread_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+
+    class Session:
+        def __init__(self):
+            self.added: list[object] = []
+
+        def add(self, value):
+            self.added.append(value)
+
+    session = Session()
+    service = GmailIntelligenceService(session)  # type: ignore[arg-type]
+    for body in ("<title>General</title><p>Complete the final step now.</p>", "Confirm your participation."):
+        message = GmailMessage(id=uuid.uuid4(), user_id=user_id, gmail_account_id=account_id, thread_id=thread_id, gmail_message_id=str(uuid.uuid4()), gmail_internal_date=datetime.now(UTC), from_address="team@example.test", to_addresses={"to": "user@example.test"}, subject="Action required", snippet=body, body_text=body, label_ids=["INBOX"])
+        service._ensure_action_task(user_id=user_id, account_id=account_id, message=message, is_new=True)
+
+    assert [task.title for task in session.added if isinstance(task, ActionTask)] == ["Complete the final step now", "Confirm your participation"]
+
+
+def test_action_title_detects_concrete_requests_but_not_status_messages() -> None:
+    assert _action_title("FINAL 60 MINUTES: Submit your Prototype Now | AI for Bharat") == "Submit your Prototype Now"
+    assert _action_title("Upload documents before Friday.") == "Upload documents"
+    assert _action_title("Complete a form to continue.") == "Complete a form to continue"
+    assert _action_title("Submission Successful for AI for Bharat") is None
+    assert _action_title("Your Certificate of Participation has been issued") is None
+    assert _action_title("Announcement of shortlisted teams") is None
+
+
+def test_task_status_update_is_account_scoped() -> None:
+    user_id, account_id, other_account_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    task = ActionTask(id=uuid.uuid4(), user_id=user_id, gmail_account_id=account_id, thread_id=uuid.uuid4(), message_id=uuid.uuid4(), title="Send availability")
+
+    class Session:
+        def scalar(self, statement):
+            return task if account_id in statement.compile().params.values() else None
+
+    service = GmailIntelligenceService(Session())  # type: ignore[arg-type]
+    assert service.update_task_status(user_id=user_id, account_id=other_account_id, task_id=task.id, status="done") is None
+    updated = service.update_task_status(user_id=user_id, account_id=account_id, task_id=task.id, status="done")
+    assert updated and updated["status"] == task.status == "done"
 
 
 def test_sync_hydrates_every_message_in_a_gmail_thread() -> None:
@@ -212,6 +333,67 @@ def test_sync_hydrates_every_message_in_a_gmail_thread() -> None:
 
     assert result == {"messages_examined": 1, "messages_imported": 3}
     assert [message["id"] for message in saved] == [item["id"] for item in fixture]
+
+
+def test_sync_uses_gmail_history_after_the_first_sync() -> None:
+    user_id, account_id = uuid.uuid4(), uuid.uuid4()
+    account = GmailAccount(id=account_id, user_id=user_id, gmail_email="user@example.test", gmail_email_normalized="user@example.test", gmail_profile_id="profile")
+    state = SimpleNamespace(history_id="100", last_successful_sync_at=None, last_error_code=None, last_error_at=None)
+    paths: list[str] = []
+    saved: list[str] = []
+
+    class Session:
+        def scalar(self, _statement):
+            return None
+
+        def scalars(self, _statement):
+            return []
+
+        def add(self, _value):
+            pass
+
+        def flush(self):
+            pass
+
+        def commit(self):
+            pass
+
+        def get(self, _model, _id):
+            return state
+
+    class Service(GmailIntelligenceService):
+        def _account(self, _user_id, _account_id):
+            return account
+
+        def _acquire_sync_lock(self, _account_id):
+            return True
+
+        def _release_sync_lock(self, _account_id):
+            pass
+
+        def _refresh_access_token(self, _token):
+            return "access-token"
+
+        def _get(self, path, _access_token):
+            paths.append(path)
+            if path == "/profile":
+                return {"historyId": "101"}
+            if path == "/history?startHistoryId=100&historyTypes=messageAdded&maxResults=500":
+                return {"history": [{"messagesAdded": [{"message": {"id": "new", "threadId": "new-thread"}}]}]}
+            if path == "/threads/new-thread?format=full":
+                return {"messages": [{"id": "new", "threadId": "new-thread", "internalDate": "0"}]}
+            raise AssertionError(path)
+
+        def _save_message(self, _user_id, _account, raw):
+            saved.append(raw["id"])
+            return 1
+
+    result = Service(Session(), token_store=SimpleNamespace(get_refresh_token=lambda **_: "refresh-token")).sync(user_id=user_id, account_id=account_id)  # type: ignore[arg-type]
+
+    assert result == {"messages_examined": 1, "messages_imported": 1}
+    assert saved == ["new"]
+    assert not any(path.startswith("/messages?") for path in paths)
+    assert state.history_id == "101"
 
 
 class ExistingThreadSession:
