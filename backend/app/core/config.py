@@ -17,6 +17,9 @@ class Settings(BaseSettings):
 
     app_env: str = "development"
     app_secret_key: str | None = None
+    local_auth_password: str | None = None
+    session_ttl_seconds: int = 28800
+    oauth_state_ttl_seconds: int = 600
     database_url: str
     local_owner_email: str = "local-owner@localhost"
     local_owner_display_name: str = "Local Owner"

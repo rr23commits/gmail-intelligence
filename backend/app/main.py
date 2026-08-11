@@ -5,15 +5,19 @@ import hashlib
 import hmac
 import json
 import logging
+import secrets
+import time
 import urllib.parse
 import uuid
+from collections import defaultdict, deque
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from threading import Lock
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse, RedirectResponse, Response
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.classification.feedback import validate_corrected_category
@@ -43,18 +47,44 @@ class ClassificationCorrection(BaseModel):
 
 class ThreadAction(BaseModel):
     action: str
-    thread_ids: list[uuid.UUID]
+    thread_ids: list[uuid.UUID] = Field(min_length=1, max_length=100)
 
 
 class ReplyRequest(BaseModel):
-    body: str
+    body: str = Field(min_length=1, max_length=10_000)
 
 
 class TaskStatusUpdate(BaseModel):
     status: str
 
 
+class LocalLogin(BaseModel):
+    password: str = Field(min_length=1, max_length=1024)
+
+
 logger = logging.getLogger(__name__)
+SESSION_COOKIE = "gmail_intelligence_session"
+OAUTH_STATE_COOKIE = "gmail_intelligence_oauth_state"
+
+
+class RateLimiter:
+    """Small local-process guard for the development API."""
+
+    # ponytail: in-memory limits reset on restart; use Redis/shared storage when scaling beyond one process.
+    def __init__(self) -> None:
+        self._hits: dict[tuple[str, str], deque[float]] = defaultdict(deque)
+        self._lock = Lock()
+
+    def allow(self, client: str, bucket: str, limit: int, window: int = 60) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            hits = self._hits[(client, bucket)]
+            while hits and hits[0] <= now - window:
+                hits.popleft()
+            if len(hits) >= limit:
+                return False
+            hits.append(now)
+            return True
 
 
 def _record_sync_failure(*, user_id: uuid.UUID, account_id: uuid.UUID, error: Exception) -> None:
@@ -86,6 +116,8 @@ async def provision_local_owner() -> None:
 
 
 def create_app(*, provision_owner_on_startup: bool = True) -> FastAPI:
+    limiter = RateLimiter()
+
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         if provision_owner_on_startup:
             await provision_local_owner()
@@ -97,30 +129,96 @@ def create_app(*, provision_owner_on_startup: bool = True) -> FastAPI:
         allow_origins=[get_settings().frontend_url],
         allow_methods=["*"],
         allow_headers=["*"],
+        allow_credentials=True,
     )
+
+    @app.middleware("http")
+    async def limit_requests(request: Request, call_next):
+        client = request.client.host if request.client else "unknown"
+        limit = 10 if request.url.path.endswith(("/sync", "/reply", "/threads/action")) else 60
+        if not limiter.allow(client, request.url.path, limit):
+            return JSONResponse({"detail": "Too many requests."}, status_code=429)
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
 
     @app.get("/health", tags=["system"])
     def health_check() -> dict[str, str]:
         return {"status": "ok"}
 
-    def owner(session: Session = Depends(get_db_session)):
+    def owner(request: Request, session: Session = Depends(get_db_session)):
+        claims = _read_session(request.cookies.get(SESSION_COOKIE))
+        if claims is None:
+            raise HTTPException(401, "Sign in required.")
         result = LocalOwnerService(UserRepository(session)).ensure_owner()
         session.commit()
+        if claims["user_id"] != str(result.id):
+            raise HTTPException(401, "Invalid session.")
         return result
 
+    @app.get("/api/v1/auth/session", tags=["auth"])
+    def session_status(local_owner=Depends(owner)) -> dict[str, str]:
+        return {"email": local_owner.email or ""}
+
+    @app.post("/api/v1/auth/login", tags=["auth"])
+    def login(credentials: LocalLogin, session: Session = Depends(get_db_session)) -> Response:
+        settings = get_settings()
+        if not settings.local_auth_password or not hmac.compare_digest(
+            credentials.password, settings.local_auth_password
+        ):
+            raise HTTPException(401, "Invalid password.")
+        local_owner = LocalOwnerService(UserRepository(session)).ensure_owner()
+        session.commit()
+        response = Response(status_code=204)
+        response.set_cookie(
+            SESSION_COOKIE,
+            _sign_session(str(local_owner.id)),
+            httponly=True,
+            secure=settings.app_env != "development",
+            samesite="lax",
+            max_age=settings.session_ttl_seconds,
+        )
+        return response
+
+    @app.post("/api/v1/auth/logout", status_code=204, tags=["auth"])
+    def logout() -> Response:
+        response = Response(status_code=204)
+        response.delete_cookie(SESSION_COOKIE)
+        return response
+
     @app.post("/api/v1/auth/gmail/start", tags=["gmail"])
-    def start_gmail_connection(local_owner=Depends(owner)) -> dict[str, str]:
+    def start_gmail_connection(local_owner=Depends(owner)) -> Response:
         settings = get_settings()
         if not settings.google_oauth_client_id or not settings.app_secret_key:
             raise HTTPException(503, "Google OAuth is not configured.")
-        return {"authorization_url": _gmail_authorization_url(str(local_owner.id))}
+        nonce = secrets.token_urlsafe(32)
+        response = JSONResponse({"authorization_url": _gmail_authorization_url(str(local_owner.id), nonce)})
+        response.set_cookie(
+            OAUTH_STATE_COOKIE,
+            nonce,
+            httponly=True,
+            secure=settings.app_env != "development",
+            samesite="lax",
+            max_age=settings.oauth_state_ttl_seconds,
+        )
+        return response
 
     @app.get("/api/v1/auth/gmail/callback", tags=["gmail"])
     def gmail_callback(
-        code: str, state: str, scope: str | None = None, session: Session = Depends(get_db_session)
+        code: str,
+        state: str,
+        request: Request,
+        scope: str | None = None,
+        session: Session = Depends(get_db_session),
     ) -> RedirectResponse:
         try:
-            user_id = uuid.UUID(_read_state(state))
+            claims = _read_state(state)
+            nonce = request.cookies.get(OAUTH_STATE_COOKIE)
+            if not nonce or not hmac.compare_digest(nonce, claims["nonce"]):
+                raise ValueError("Invalid OAuth state.")
+            user_id = uuid.UUID(claims["user_id"])
             if scope is not None and GMAIL_READONLY_SCOPE not in scope.split():
                 raise GmailApiError("Gmail permission was not granted. Connect again and allow Gmail read access.")
             settings = get_settings()
@@ -134,10 +232,12 @@ def create_app(*, provision_owner_on_startup: bool = True) -> FastAPI:
             account = GmailAccountService(GmailAccountRepository(session)).register_account_metadata(user_id=user_id, gmail_email=profile["emailAddress"], gmail_profile_id=profile["emailAddress"], display_name=profile["emailAddress"].split("@", 1)[0])
             MacOSKeychainTokenStore().save_refresh_token(gmail_account_id=account.id, refresh_token=refresh_token)
             session.commit()
-            return RedirectResponse(f"{settings.frontend_url}/accounts?connected=1")
-        except (GmailApiError, ValueError, KeyError) as exc:
+            response = RedirectResponse(f"{settings.frontend_url}/accounts?connected=1")
+        except (GmailApiError, ValueError, KeyError):
             session.rollback()
-            return RedirectResponse(f"{get_settings().frontend_url}/accounts?error={urllib.parse.quote(str(exc))}")
+            response = RedirectResponse(f"{get_settings().frontend_url}/accounts?error=connection_failed")
+        response.delete_cookie(OAUTH_STATE_COOKIE)
+        return response
 
     @app.get("/api/v1/accounts", tags=["gmail"])
     def accounts(local_owner=Depends(owner), session: Session = Depends(get_db_session)) -> list[dict]:
@@ -358,13 +458,53 @@ GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
 
-def _sign_state(user_id: str) -> str:
-    payload = base64.urlsafe_b64encode(json.dumps({"user_id": user_id}).encode()).decode().rstrip("=")
-    signature = hmac.new(get_settings().app_secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
-    return f"{payload}.{signature}"
+def _sign_payload(payload: dict[str, object]) -> str:
+    encoded = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
+    signature = hmac.new(get_settings().app_secret_key.encode(), encoded.encode(), hashlib.sha256).hexdigest()
+    return f"{encoded}.{signature}"
 
 
-def _gmail_authorization_url(user_id: str) -> str:
+def _read_payload(value: str) -> dict[str, object]:
+    try:
+        payload, signature = value.rsplit(".", 1)
+    except ValueError as exc:
+        raise ValueError("Invalid signed value.") from exc
+    expected = hmac.new(get_settings().app_secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        raise TypeError("Invalid signed value.")
+    decoded = json.loads(base64.urlsafe_b64decode(payload + "=="))
+    if not isinstance(decoded, dict):
+        raise TypeError("Invalid signed value.")
+    return decoded
+
+
+def _sign_session(user_id: str) -> str:
+    return _sign_payload({"user_id": user_id, "expires_at": int(time.time()) + get_settings().session_ttl_seconds})
+
+
+def _read_session(value: str | None) -> dict[str, str] | None:
+    if not value:
+        return None
+    try:
+        claims = _read_payload(value)
+        if not isinstance(claims.get("user_id"), str) or int(claims["expires_at"]) < time.time():
+            return None
+        return {"user_id": claims["user_id"]}
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def _sign_state(user_id: str, nonce: str) -> str:
+    return _sign_payload(
+        {
+            "user_id": user_id,
+            "nonce": nonce,
+            "expires_at": int(time.time()) + get_settings().oauth_state_ttl_seconds,
+        }
+    )
+
+
+def _gmail_authorization_url(user_id: str, nonce: str = "test-nonce") -> str:
     settings = get_settings()
     query = urllib.parse.urlencode(
         {
@@ -375,18 +515,21 @@ def _gmail_authorization_url(user_id: str) -> str:
             "access_type": "offline",
             "include_granted_scopes": "true",
             "prompt": "consent",
-            "state": _sign_state(user_id),
+            "state": _sign_state(user_id, nonce),
         }
     )
     return f"https://accounts.google.com/o/oauth2/v2/auth?{query}"
 
 
-def _read_state(state: str) -> str:
+def _read_state(state: str) -> dict[str, str]:
     try:
-        payload, signature = state.rsplit(".", 1)
-    except ValueError as exc:
+        claims = _read_payload(state)
+        if (
+            not isinstance(claims.get("user_id"), str)
+            or not isinstance(claims.get("nonce"), str)
+            or int(claims["expires_at"]) < time.time()
+        ):
+            raise ValueError("Invalid OAuth state.")
+        return {"user_id": claims["user_id"], "nonce": claims["nonce"]}
+    except (TypeError, ValueError, KeyError) as exc:
         raise ValueError("Invalid OAuth state.") from exc
-    expected = hmac.new(get_settings().app_secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(signature, expected):
-        raise ValueError("Invalid OAuth state.")
-    return json.loads(base64.urlsafe_b64decode(payload + "=="))["user_id"]

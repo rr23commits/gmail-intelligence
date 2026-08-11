@@ -24,7 +24,10 @@ export type CleanupGroup = { key: string; title: string; description: string; it
 export type Cleanup = { total_impact: number; groups: CleanupGroup[]; next_offset: number | null };
 export type Account = { id: string; email: string; name: string | null; status: string; last_synced_at: string | null };
 export type SyncRun = { status: string; started_at: string; completed_at: string | null; messages_examined: number; messages_imported: number; error_code: string | null; error_summary: string | null };
-async function api<T>(path: string, init?: RequestInit): Promise<T> { const response = await fetch(`${apiBaseUrl}${path}`, init); if (!response.ok) { const error = await response.json().catch(() => ({})); throw new Error(error.detail || "Request failed."); } return response.status === 204 ? undefined as T : response.json() as Promise<T>; }
+async function api<T>(path: string, init?: RequestInit): Promise<T> { const response = await fetch(`${apiBaseUrl}${path}`, { credentials: "include", ...init }); if (!response.ok) { const error = await response.json().catch(() => ({})); throw new Error(error.detail || "Request failed."); } return response.status === 204 ? undefined as T : response.json() as Promise<T>; }
+export const getSession = () => api<{ email: string }>("/api/v1/auth/session");
+export const login = (password: string) => api<void>("/api/v1/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password }) });
+export const logout = () => api<void>("/api/v1/auth/logout", { method: "POST" });
 export const getDashboard = (accountId?: string) => api<DailyBriefing>(`/api/v1/dashboard${accountId ? `?account_id=${accountId}` : ""}`);
 export type IntelligenceFilter = { accountId?: string; category?: string; review?: boolean; decision?: string; limit?: number; offset?: number };
 export const getIntelligence = (filter: IntelligenceFilter = {}) => {
