@@ -23,6 +23,7 @@ from app.services.gmail_intelligence_service import (
     _action_title,
     _decision_bucket,
     _display_body,
+    _explicit_deadline,
     _related_conversation_messages,
 )
 
@@ -146,6 +147,12 @@ def test_display_body_renders_html_email_without_raw_markup_or_whitespace_noise(
     assert _display_body("Hello\nPlain text") == "<p>Hello Plain text</p>"
 
 
+def test_explicit_deadline_strips_html_and_inline_styles() -> None:
+    message = GmailMessage(id=uuid.uuid4(), user_id=uuid.uuid4(), gmail_account_id=uuid.uuid4(), thread_id=uuid.uuid4(), gmail_message_id="deadline", gmail_internal_date=datetime.now(UTC), from_address="team@example.test", to_addresses={"to": "user@example.test"}, subject="Deadline", snippet="", body_text='Deadline extension expires in just <span style="font-size: 13pt; color: rgb(0, 0, 0)">one hour</span>', label_ids=["INBOX"])
+
+    assert _explicit_deadline([message]) == "Deadline extension expires in just one hour"
+
+
 def test_explicit_action_creates_an_open_task_with_its_deadline() -> None:
     user_id, account_id, thread_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     thread = GmailThread(id=thread_id, user_id=user_id, gmail_account_id=account_id, gmail_thread_id="task", latest_message_at=datetime.now(UTC))
@@ -157,6 +164,8 @@ def test_explicit_action_creates_an_open_task_with_its_deadline() -> None:
 
     task = next(item for item in session.added if isinstance(item, ActionTask))
     assert (task.title, task.status, task.deadline, task.thread_id) == ("Send your availability for an interview", "open", "by Friday", thread_id)
+    source = next(item for item in session.added if isinstance(item, GmailMessage))
+    assert session.events.index(("add", source)) < session.events.index(("flush", None)) < session.events.index(("add", task))
 
 
 def test_non_actionable_email_creates_no_task() -> None:
@@ -246,6 +255,65 @@ def test_action_title_detects_concrete_requests_but_not_status_messages() -> Non
     assert _action_title("Submission Successful for AI for Bharat") is None
     assert _action_title("Your Certificate of Participation has been issued") is None
     assert _action_title("Announcement of shortlisted teams") is None
+    assert _action_title("Send it to <span>5,00,000+ subscribers</span>") is None
+
+
+def test_dashboard_reuses_open_tasks_consider_and_cleanup_data() -> None:
+    user_id, account_id, thread_id, message_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    task = ActionTask(id=uuid.uuid4(), user_id=user_id, gmail_account_id=account_id, thread_id=thread_id, message_id=message_id, title="Submit your prototype", deadline="by Friday", status="open")
+    thread = GmailThread(id=thread_id, user_id=user_id, gmail_account_id=account_id, gmail_thread_id="briefing", subject_normalized="Prototype deadline", latest_message_at=datetime.now(UTC))
+    account = GmailAccount(id=account_id, user_id=user_id, gmail_email="user@example.test", gmail_email_normalized="user@example.test", gmail_profile_id="profile")
+    classification = Classification(user_id=user_id, gmail_account_id=account_id, thread_id=thread_id, category="action_required", priority_score=90, confidence=0.9, explanation={}, source="local_deterministic", classifier_version="m5.1-local", is_current=True)
+    consider = [{"id": str(uuid.uuid4()), "subject": "A relevant opportunity", "category": "opportunity", "priority": 55}]
+
+    class Session:
+        def execute(self, statement):
+            assert account_id in statement.compile().params.values()
+            return [(task, thread, account, classification)]
+
+    class Service(GmailIntelligenceService):
+        def feed(self, *, user_id, account_id=None, decision=None, **_kwargs):
+            assert user_id == task.user_id and account_id == task.gmail_account_id and decision == CONSIDER
+            return consider
+
+        def cleanup(self, *, user_id, account_id=None, **_kwargs):
+            assert user_id == task.user_id and account_id == task.gmail_account_id
+            return {"total_impact": 7}
+
+        def _decision_count(self, **_kwargs):
+            return 1
+
+        def _cleanup_count(self, **_kwargs):
+            return 7
+
+    briefing = Service(Session()).dashboard(user_id=user_id, account_id=account_id)  # type: ignore[arg-type]
+
+    assert briefing["tasks"] == [{
+        "id": str(task.id), "title": "Submit your prototype", "deadline": "by Friday", "status": "open",
+        "source_thread_id": str(thread_id), "source_message_id": str(message_id), "account_id": str(account_id),
+        "account": "user@example.test", "priority": 90, "latest_event": "Prototype deadline", "open_action": "Submit your prototype",
+    }]
+    assert briefing["consider"] == consider
+    assert briefing["consider_count"] == 1
+    assert briefing["cleanup_count"] == 7
+
+
+def test_sync_runs_are_account_scoped() -> None:
+    user_id, account_id = uuid.uuid4(), uuid.uuid4()
+    account = GmailAccount(id=account_id, user_id=user_id, gmail_email="user@example.test", gmail_email_normalized="user@example.test", gmail_profile_id="profile")
+    run = SyncRun(user_id=user_id, gmail_account_id=account_id, mode="manual", status="failed", messages_examined=0, messages_imported=0, error_code="IntegrityError", error_summary="source message missing")
+
+    class Session:
+        def scalar(self, _statement):
+            return account
+
+        def scalars(self, statement):
+            assert account_id in statement.compile().params.values()
+            return [run]
+
+    logs = GmailIntelligenceService(Session()).sync_runs(user_id=user_id, account_id=account_id)  # type: ignore[arg-type]
+
+    assert logs == [{"status": "failed", "started_at": run.started_at, "completed_at": None, "messages_examined": 0, "messages_imported": 0, "error_code": "IntegrityError", "error_summary": "source message missing"}]
 
 
 def test_task_status_update_is_account_scoped() -> None:
@@ -401,6 +469,7 @@ class ExistingThreadSession:
         self.thread = thread
         self.current = current
         self.added: list[object] = []
+        self.events: list[tuple[str, object | None]] = []
         self.executed = 0
         self.scalar_calls = 0
 
@@ -418,9 +487,10 @@ class ExistingThreadSession:
 
     def add(self, value: object) -> None:
         self.added.append(value)
+        self.events.append(("add", value))
 
     def flush(self) -> None:
-        pass
+        self.events.append(("flush", None))
 
 
 def test_saving_a_message_reuses_an_existing_gmail_thread() -> None:
@@ -610,6 +680,15 @@ def test_duplicate_sync_request_is_rejected_before_gmail_work() -> None:
         raise AssertionError("duplicate sync request was not rejected")
 
 
+def test_sync_lock_is_transaction_scoped() -> None:
+    class Session:
+        def scalar(self, statement):
+            assert "pg_try_advisory_xact_lock" in str(statement)
+            return True
+
+    assert GmailIntelligenceService(Session())._acquire_sync_lock(uuid.uuid4())  # type: ignore[arg-type]
+
+
 def test_interrupted_sync_runs_are_recovered() -> None:
     run = SyncRun(user_id=uuid.uuid4(), gmail_account_id=uuid.uuid4(), mode="manual", status="running", started_at=datetime(2020, 1, 1, tzinfo=UTC))
 
@@ -731,13 +810,17 @@ def test_cleanup_groups_candidates_by_sender_and_category() -> None:
             assert kwargs["decision"] == CLEAN_UP
             return [promotional, notification]
 
-        def _classified_thread_rows(self, **_kwargs):
+    class Session:
+        def execute(self, _statement):
             return [
-                (None, SimpleNamespace(id=uuid.UUID(promotional["id"])), None, SimpleNamespace(from_address="news@store.test")),
-                (None, SimpleNamespace(id=uuid.UUID(notification["id"])), None, SimpleNamespace(from_address="alerts@updates.test")),
+                (uuid.UUID(promotional["id"]), "news@store.test"),
+                (uuid.UUID(notification["id"]), "alerts@updates.test"),
             ]
 
-    cleanup = CleanupService(object()).cleanup(user_id=uuid.uuid4())
+        def scalar(self, _statement):
+            return 2
+
+    cleanup = CleanupService(Session()).cleanup(user_id=uuid.uuid4())
 
     assert cleanup["total_impact"] == 2
     assert {group["key"] for group in cleanup["groups"]} == {"store.test:promotional_bulk", "updates.test:notification"}

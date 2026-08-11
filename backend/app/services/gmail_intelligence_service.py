@@ -15,7 +15,7 @@ from html.parser import HTMLParser
 from typing import ClassVar
 from urllib.parse import urlparse
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -77,7 +77,6 @@ class GmailIntelligenceService:
             )
         )
         if active is not None:
-            self._release_sync_lock(account.id)
             raise SyncAlreadyRunning("A Gmail sync is already running for this account.")
         run = SyncRun(user_id=user_id, gmail_account_id=account.id, mode="manual", status="running")
         self.session.add(run)
@@ -119,9 +118,6 @@ class GmailIntelligenceService:
             run.status, run.completed_at, run.error_code = "failed", datetime.now(UTC), type(exc).__name__
             run.error_summary = str(exc)[:500]
             raise
-        finally:
-            self._release_sync_lock(account.id)
-
     def _sync_full(self, *, user_id: uuid.UUID, account: GmailAccount, access_token: str) -> tuple[int, int]:
         imported = examined = 0
         page_token: str | None = None
@@ -178,12 +174,9 @@ class GmailIntelligenceService:
     def _acquire_sync_lock(self, account_id: uuid.UUID) -> bool:
         return bool(
             self.session.scalar(
-                select(func.pg_try_advisory_lock(func.hashtextextended(str(account_id), 0)))
+                select(func.pg_try_advisory_xact_lock(func.hashtextextended(str(account_id), 0)))
             )
         )
-
-    def _release_sync_lock(self, account_id: uuid.UUID) -> None:
-        self.session.scalar(select(func.pg_advisory_unlock(func.hashtextextended(str(account_id), 0))))
 
     def _recover_stale_runs(self, *, user_id: uuid.UUID, account_id: uuid.UUID) -> int:
         stale = list(
@@ -214,6 +207,8 @@ class GmailIntelligenceService:
         category: str | None = None,
         review: bool = False,
         decision: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[dict]:
         statement = (
             select(Classification, GmailThread, GmailAccount)
@@ -228,11 +223,24 @@ class GmailIntelligenceService:
             statement = statement.where(Classification.category == category)
         if review:
             statement = statement.where(Classification.priority_score.between(35, 79))
-        return [
+        if decision:
+            categories = {
+                DO: ("action_required",),
+                CONSIDER: ("opportunity", "important_keep", "personal_conversation"),
+                CLEAN_UP: tuple(category for category in CATEGORIES if category not in {"action_required", "opportunity", "important_keep", "personal_conversation"}),
+            }[decision]
+            statement = statement.where(Classification.category.in_(categories))
+        if offset:
+            statement = statement.offset(offset)
+        if limit is not None:
+            statement = statement.limit(limit)
+        items = [
             self._feed_item(classification, thread, account)
             for classification, thread, account in self.session.execute(statement)
-            if decision is None or _decision_bucket(classification.category, classification.priority_score) == decision
         ]
+        # The query performs this filtering in production; keep the result
+        # contract intact for alternate session implementations too.
+        return [item for item in items if decision is None or _decision_bucket(item["category"], item["priority"]) == decision]
 
     def detail(
         self, *, user_id: uuid.UUID, thread_id: uuid.UUID, message_id: uuid.UUID | None = None
@@ -379,23 +387,82 @@ class GmailIntelligenceService:
             )
         return sorted(preferences, key=lambda item: (-item["correction_count"], item["domain"]))
 
-    def cleanup(self, *, user_id: uuid.UUID, account_id: uuid.UUID | None = None) -> dict:
-        candidates = {
-            item["id"]: item
-            for item in self.feed(user_id=user_id, account_id=account_id, decision=CLEAN_UP)
-        }
-        senders = {str(thread.id): _sender_domain(message.from_address) for _, thread, _, message in self._classified_thread_rows(user_id=user_id, account_id=account_id)}
+    def cleanup(self, *, user_id: uuid.UUID, account_id: uuid.UUID | None = None, limit: int | None = None, offset: int = 0) -> dict:
+        candidates = {item["id"]: item for item in self.feed(user_id=user_id, account_id=account_id, decision=CLEAN_UP, limit=limit, offset=offset)}
+        sender_rows = self.session.execute(
+            select(GmailThread.id, GmailMessage.from_address)
+            .join(GmailMessage, GmailMessage.thread_id == GmailThread.id)
+            .where(GmailThread.id.in_([uuid.UUID(item_id) for item_id in candidates]))
+            .order_by(GmailThread.id, GmailMessage.gmail_internal_date.desc())
+        ) if candidates else []
+        senders: dict[str, str] = {}
+        for thread_id, sender in sender_rows:
+            senders.setdefault(str(thread_id), _sender_domain(sender))
         groups: dict[tuple[str, str], list[dict]] = {}
         for item in candidates.values():
             sender = senders.get(item["id"], "")
             groups.setdefault((sender or "unknown-sender", item["category"]), []).append(item)
+        total_impact = self._cleanup_count(user_id=user_id, account_id=account_id)
         return {
-            "total_impact": len(candidates),
+            "total_impact": total_impact,
             "groups": [
                 {"key": f"{sender}:{category}", "title": sender, "description": category.replace("_", " "), "items": items}
                 for (sender, category), items in sorted(groups.items())
             ],
+            "next_offset": offset + len(candidates) if limit is not None and offset + len(candidates) < total_impact else None,
         }
+
+    def dashboard(self, *, user_id: uuid.UUID, account_id: uuid.UUID | None = None) -> dict:
+        """A daily briefing assembled from the existing M3–M5 records."""
+        statement = (
+            select(ActionTask, GmailThread, GmailAccount, Classification)
+            .join(GmailThread, ActionTask.thread_id == GmailThread.id)
+            .join(GmailAccount, ActionTask.gmail_account_id == GmailAccount.id)
+            .outerjoin(Classification, and_(Classification.thread_id == GmailThread.id, Classification.is_current))
+            .where(ActionTask.user_id == user_id, ActionTask.status == "open")
+            .order_by(ActionTask.deadline.is_(None), Classification.priority_score.desc().nullslast(), GmailThread.latest_message_at.desc())
+        )
+        if account_id:
+            statement = statement.where(ActionTask.gmail_account_id == account_id)
+        tasks = self.session.execute(statement.limit(5))
+        consider = self.feed(user_id=user_id, account_id=account_id, decision=CONSIDER, limit=5)
+        return {
+            "tasks": [
+                {
+                    **_task_item(task),
+                    "account_id": str(account.id),
+                    "account": account.gmail_email,
+                    "priority": classification.priority_score if classification else 0,
+                    "latest_event": thread.subject_normalized or thread.snippet,
+                    # M4 and M5 intentionally share the same deterministic action extraction.
+                    "open_action": task.title,
+                }
+                for task, thread, account, classification in tasks
+            ],
+            "consider": consider[:5],
+            "consider_count": self._decision_count(user_id=user_id, account_id=account_id, decision=CONSIDER),
+            "cleanup_count": self._cleanup_count(user_id=user_id, account_id=account_id),
+        }
+
+    def sync_runs(self, *, user_id: uuid.UUID, account_id: uuid.UUID) -> list[dict]:
+        self._account(user_id, account_id)
+        return [
+            {
+                "status": run.status,
+                "started_at": run.started_at,
+                "completed_at": run.completed_at,
+                "messages_examined": run.messages_examined,
+                "messages_imported": run.messages_imported,
+                "error_code": run.error_code,
+                "error_summary": run.error_summary,
+            }
+            for run in self.session.scalars(
+                select(SyncRun)
+                .where(SyncRun.user_id == user_id, SyncRun.gmail_account_id == account_id)
+                .order_by(SyncRun.started_at.desc())
+                .limit(5)
+            )
+        ]
 
     def _classified_thread_rows(self, *, user_id: uuid.UUID, account_id: uuid.UUID | None) -> list[tuple]:
         statement = (
@@ -415,9 +482,29 @@ class GmailIntelligenceService:
 
     def _decision_counts(self, *, user_id: uuid.UUID, account_id: uuid.UUID | None) -> dict[str, int]:
         counts = {DO: 0, CONSIDER: 0, CLEAN_UP: 0}
-        for classification, _, _, _ in self._classified_thread_rows(user_id=user_id, account_id=account_id):
-            counts[_decision_bucket(classification.category, classification.priority_score)] += 1
+        for category, count in self._category_counts(user_id=user_id, account_id=account_id):
+            counts[_decision_bucket(category, 0)] += count
         return counts
+
+    def _decision_count(self, *, user_id: uuid.UUID, account_id: uuid.UUID | None, decision: str) -> int:
+        categories = {
+            DO: ("action_required",),
+            CONSIDER: ("opportunity", "important_keep", "personal_conversation"),
+            CLEAN_UP: tuple(category for category in CATEGORIES if category not in {"action_required", "opportunity", "important_keep", "personal_conversation"}),
+        }[decision]
+        statement = select(func.count()).select_from(Classification).join(GmailThread, Classification.thread_id == GmailThread.id).where(Classification.user_id == user_id, Classification.is_current, GmailThread.is_in_inbox, Classification.category.in_(categories))
+        if account_id:
+            statement = statement.where(Classification.gmail_account_id == account_id)
+        return self.session.scalar(statement) or 0
+
+    def _cleanup_count(self, *, user_id: uuid.UUID, account_id: uuid.UUID | None) -> int:
+        return self._decision_count(user_id=user_id, account_id=account_id, decision=CLEAN_UP)
+
+    def _category_counts(self, *, user_id: uuid.UUID, account_id: uuid.UUID | None) -> list[tuple[str, int]]:
+        statement = select(Classification.category, func.count()).join(GmailThread, Classification.thread_id == GmailThread.id).where(Classification.user_id == user_id, Classification.is_current, GmailThread.is_in_inbox).group_by(Classification.category)
+        if account_id:
+            statement = statement.where(Classification.gmail_account_id == account_id)
+        return list(self.session.execute(statement))
 
     def apply_thread_action(
         self, *, user_id: uuid.UUID, account_id: uuid.UUID, thread_ids: list[uuid.UUID], action: str
@@ -565,6 +652,7 @@ class GmailIntelligenceService:
         delivery_metadata = _delivery_metadata(headers)
         message = GmailMessage(id=uuid.uuid4(), user_id=user_id, gmail_account_id=account.id, thread_id=thread.id, gmail_message_id=raw["id"], gmail_internal_date=internal_date, from_address=headers.get("from", "Unknown"), to_addresses={"to": headers.get("to", "")}, cc_addresses={"cc": headers["cc"]} if headers.get("cc") else None, subject=headers.get("subject"), snippet=raw.get("snippet"), body_text=body, label_ids=raw.get("labelIds", []), delivery_metadata=delivery_metadata, has_attachments=False)
         self.session.add(message)
+        self.session.flush()
         self._ensure_action_task(user_id=user_id, account_id=account.id, message=message, is_new=True)
         thread.message_count += 1
         decision = classify_thread_m5_1(
@@ -876,6 +964,13 @@ def _clean_display_text(text: str) -> str:
     return re.sub(r"[ \t]+", " ", text).strip()
 
 
+def _email_text(text: str | None) -> str:
+    """Readable text for deterministic extraction; raw MIME content stays untouched."""
+    text = re.sub(r"<(?:style|script)\b[^>]*>.*?</(?:style|script)>", " ", text or "", flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"</?(?:br|p|div|li|tr|h[1-6])\b[^>]*>", "\n", text, flags=re.IGNORECASE)
+    return re.sub(r"[ \t]+", " ", unescape(re.sub(r"<[^>]+>", " ", text)))
+
+
 def _linkify(text: str) -> str:
     parts = re.split(r"(https?://[^\s<]+)", text)
     return "".join(
@@ -899,6 +994,8 @@ def _action_title(body: str) -> str | None:
     for pattern in _TASK_REQUESTS:
         if match := pattern.search(text):
             title = re.sub(r"\s+(?:by|before)\s+.+$", "", match["task"]).strip(" :.-")
+            if re.fullmatch(r"(?:send|reply|respond)\s+(?:it|this|them)(?:\s+to)?", " ".join(title.split()), re.IGNORECASE):
+                continue
             return title[:1].upper() + title[1:]
     return None
 
@@ -907,7 +1004,7 @@ def _task_item(task: ActionTask) -> dict:
     return {
         "id": str(task.id),
         "title": task.title,
-        "deadline": task.deadline,
+        "deadline": " ".join(_email_text(task.deadline).split()) or None,
         "status": task.status,
         "source_thread_id": str(task.thread_id),
         "source_message_id": str(task.message_id),
@@ -928,12 +1025,12 @@ def _thread_intelligence(*, messages: list[GmailMessage], explanation: dict, is_
 
 def _explicit_deadline(messages: list[GmailMessage]) -> str | None:
     pattern = re.compile(
-        r"\b(?:deadline|due(?:\s+on)?)(?:\s+is)?\s*[:\-]?\s*[^.!\n]+"
-        r"|\bby\s+(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}(?:st|nd|rd|th)?\b[^.!\n]*)",
+        r"\b(?:deadline|due(?:[ \t]+on)?)(?:[ \t]+is)?[ \t]*[:\-]?[ \t]*[^.!\n]+"
+        r"|\bby[ \t]+(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}(?:st|nd|rd|th)?\b[^.!\n]*)",
         re.IGNORECASE,
     )
     for message in reversed(messages):
-        if match := pattern.search(f"{message.subject or ''}\n{message.body_text or message.snippet or ''}"):
+        if match := pattern.search(_email_text(f"{message.subject or ''}\n{message.body_text or message.snippet or ''}")):
             return match.group(0).strip()
     return None
 

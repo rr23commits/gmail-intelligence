@@ -4,9 +4,11 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import urllib.parse
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,7 +19,8 @@ from sqlalchemy.orm import Session
 from app.classification.feedback import validate_corrected_category
 from app.classification.m5 import CATEGORIES
 from app.core.config import get_settings
-from app.db.session import get_db_session
+from app.db.session import SessionLocal, get_db_session
+from app.models.gmail_data import SyncRun
 from app.repositories.gmail_account_repository import GmailAccountRepository
 from app.repositories.user_repository import UserRepository
 from app.security.macos_keychain_token_store import MacOSKeychainTokenStore
@@ -49,6 +52,26 @@ class ReplyRequest(BaseModel):
 
 class TaskStatusUpdate(BaseModel):
     status: str
+
+
+logger = logging.getLogger(__name__)
+
+
+def _record_sync_failure(*, user_id: uuid.UUID, account_id: uuid.UUID, error: Exception) -> None:
+    """Keep a user-visible failure record after the import transaction rolls back."""
+    with SessionLocal() as log_session:
+        log_session.add(
+            SyncRun(
+                user_id=user_id,
+                gmail_account_id=account_id,
+                mode="manual",
+                status="failed",
+                completed_at=datetime.now(UTC),
+                error_code=type(error).__name__,
+                error_summary=str(error)[:500],
+            )
+        )
+        log_session.commit()
 
 
 async def provision_local_owner() -> None:
@@ -130,9 +153,18 @@ def create_app(*, provision_owner_on_startup: bool = True) -> FastAPI:
             raise HTTPException(404, str(exc)) from exc
         except SyncAlreadyRunning as exc:
             raise HTTPException(409, str(exc)) from exc
-        except (GmailApiError, RuntimeError) as exc:
+        except Exception as exc:
             session.rollback()
-            raise HTTPException(502, str(exc)) from exc
+            _record_sync_failure(user_id=local_owner.id, account_id=account_id, error=exc)
+            logger.exception("Gmail sync failed account=%s", account_id)
+            raise HTTPException(502, "Sync failed. Open Sync log for details.") from exc
+
+    @app.get("/api/v1/accounts/{account_id}/sync-runs", tags=["gmail"])
+    def sync_runs(account_id: uuid.UUID, local_owner=Depends(owner), session: Session = Depends(get_db_session)) -> list[dict]:
+        try:
+            return GmailIntelligenceService(session).sync_runs(user_id=local_owner.id, account_id=account_id)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
 
     @app.post("/api/v1/accounts/{account_id}/threads/action", tags=["gmail"])
     def thread_action(
@@ -191,6 +223,8 @@ def create_app(*, provision_owner_on_startup: bool = True) -> FastAPI:
         category: str | None = None,
         review: bool = False,
         decision: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
         local_owner=Depends(owner),
         session: Session = Depends(get_db_session),
     ) -> list[dict]:
@@ -200,12 +234,16 @@ def create_app(*, provision_owner_on_startup: bool = True) -> FastAPI:
             raise HTTPException(422, "review is a priority view and cannot be combined with category.")
         if decision is not None and decision not in {DO, CONSIDER, CLEAN_UP}:
             raise HTTPException(422, "decision must be do, consider, or clean_up.")
+        if not 1 <= limit <= 100 or offset < 0:
+            raise HTTPException(422, "limit must be 1–100 and offset must not be negative.")
         return GmailIntelligenceService(session).feed(
             user_id=local_owner.id,
             account_id=account_id,
             category=category,
             review=review,
             decision=decision,
+            limit=limit,
+            offset=offset,
         )
 
     @app.get("/api/v1/intelligence/{thread_id:uuid}", tags=["intelligence"])
@@ -274,10 +312,14 @@ def create_app(*, provision_owner_on_startup: bool = True) -> FastAPI:
     @app.get("/api/v1/intelligence/cleanup", tags=["intelligence"])
     def intelligence_cleanup(
         account_id: uuid.UUID | None = None,
+        limit: int = 100,
+        offset: int = 0,
         local_owner=Depends(owner),
         session: Session = Depends(get_db_session),
     ) -> dict:
-        return GmailIntelligenceService(session).cleanup(user_id=local_owner.id, account_id=account_id)
+        if not 1 <= limit <= 100 or offset < 0:
+            raise HTTPException(422, "limit must be 1–100 and offset must not be negative.")
+        return GmailIntelligenceService(session).cleanup(user_id=local_owner.id, account_id=account_id, limit=limit, offset=offset)
 
     @app.post("/api/v1/intelligence/{thread_id}/classification-feedback", tags=["intelligence"])
     def classification_feedback(
@@ -301,9 +343,10 @@ def create_app(*, provision_owner_on_startup: bool = True) -> FastAPI:
         return result
 
     @app.get("/api/v1/dashboard", tags=["intelligence"])
-    def dashboard(local_owner=Depends(owner), session: Session = Depends(get_db_session)) -> dict:
-        feed = GmailIntelligenceService(session).feed(user_id=local_owner.id)
-        return {"items": feed[:5], "action_required": sum(item["priority"] >= 70 for item in feed), "accounts": len(GmailAccountService(GmailAccountRepository(session)).list_accounts(user_id=local_owner.id))}
+    def dashboard(account_id: uuid.UUID | None = None, local_owner=Depends(owner), session: Session = Depends(get_db_session)) -> dict:
+        if account_id and GmailAccountRepository(session).get_for_user(user_id=local_owner.id, account_id=account_id) is None:
+            raise HTTPException(404, "Gmail account not found.")
+        return GmailIntelligenceService(session).dashboard(user_id=local_owner.id, account_id=account_id)
 
     return app
 
