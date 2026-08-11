@@ -22,12 +22,13 @@ export type Cleanup = { total_impact: number; groups: CleanupGroup[] };
 export type Account = { id: string; email: string; name: string | null; status: string; last_synced_at: string | null };
 async function api<T>(path: string, init?: RequestInit): Promise<T> { const response = await fetch(`${apiBaseUrl}${path}`, init); if (!response.ok) throw new Error(await response.text()); return response.status === 204 ? undefined as T : response.json() as Promise<T>; }
 export const getDashboard = () => api<{ items: IntelligenceItem[]; action_required: number; accounts: number }>("/api/v1/dashboard");
-export type IntelligenceFilter = { accountId?: string; category?: string; review?: boolean };
+export type IntelligenceFilter = { accountId?: string; category?: string; review?: boolean; decision?: string };
 export const getIntelligence = (filter: IntelligenceFilter = {}) => {
   const params = new URLSearchParams();
   if (filter.accountId) params.set("account_id", filter.accountId);
   if (filter.category) params.set("category", filter.category);
   if (filter.review) params.set("review", "true");
+  if (filter.decision) params.set("decision", filter.decision);
   const query = params.size ? `?${params}` : "";
   return api<IntelligenceItem[]>(`/api/v1/intelligence${query}`);
 };

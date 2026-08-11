@@ -283,9 +283,56 @@ def test_m2_overview_and_decision_mapping_are_data_backed() -> None:
     assert overview["categories"]["notification"] == 3
     assert overview["decisions"] == {DO: 2, CONSIDER: 1, CLEAN_UP: 3}
     assert _decision_bucket("action_required", 1) == DO
-    assert _decision_bucket("important_keep", 80) == DO
+    assert _decision_bucket("important_keep", 80) == CONSIDER
     assert _decision_bucket("opportunity", 1) == CONSIDER
     assert _decision_bucket("notification", 99) == CLEAN_UP
+
+
+def test_feed_filters_with_the_same_decision_buckets_as_overview() -> None:
+    def row(category: str, priority_score: int) -> tuple:
+        return (
+            SimpleNamespace(category=category, priority_score=priority_score, confidence=0.9, explanation={}),
+            SimpleNamespace(
+                id=uuid.uuid4(),
+                subject_normalized=category,
+                snippet="",
+                latest_message_at=datetime.now(UTC),
+                is_unread=False,
+            ),
+            SimpleNamespace(id=uuid.uuid4(), gmail_email="user@example.test"),
+        )
+
+    rows = [
+        row("action_required", 20),
+        row("important_keep", 80),
+        row("important_keep", 79),
+        row("opportunity", 50),
+        row("personal_conversation", 50),
+        row("promotional_bulk", 20),
+        row("notification", 20),
+        row("otp_verification", 20),
+        row("unclear", 20),
+    ]
+
+    class Session:
+        def execute(self, _statement):
+            return rows
+
+    service = GmailIntelligenceService(Session())
+
+    assert [item["category"] for item in service.feed(user_id=uuid.uuid4(), decision=DO)] == ["action_required"]
+    assert [item["category"] for item in service.feed(user_id=uuid.uuid4(), decision=CONSIDER)] == [
+        "important_keep",
+        "important_keep",
+        "opportunity",
+        "personal_conversation",
+    ]
+    assert [item["category"] for item in service.feed(user_id=uuid.uuid4(), decision=CLEAN_UP)] == [
+        "promotional_bulk",
+        "notification",
+        "otp_verification",
+        "unclear",
+    ]
 
 
 def test_sender_groups_preserve_each_current_category() -> None:
@@ -314,10 +361,8 @@ def test_cleanup_groups_candidates_by_sender_and_category() -> None:
 
     class CleanupService(GmailIntelligenceService):
         def feed(self, **kwargs):
-            return [promotional] if kwargs["category"] == "promotional_bulk" else [notification]
-
-        def _safe_low_priority(self, **_kwargs):
-            return [promotional]
+            assert kwargs["decision"] == CLEAN_UP
+            return [promotional, notification]
 
         def _classified_thread_rows(self, **_kwargs):
             return [

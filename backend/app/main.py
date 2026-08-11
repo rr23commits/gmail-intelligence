@@ -23,6 +23,9 @@ from app.repositories.user_repository import UserRepository
 from app.security.macos_keychain_token_store import MacOSKeychainTokenStore
 from app.services.gmail_account_service import GmailAccountService
 from app.services.gmail_intelligence_service import (
+    CLEAN_UP,
+    CONSIDER,
+    DO,
     GmailApiError,
     GmailIntelligenceService,
     SyncAlreadyRunning,
@@ -183,6 +186,7 @@ def create_app(*, provision_owner_on_startup: bool = True) -> FastAPI:
         account_id: uuid.UUID | None = None,
         category: str | None = None,
         review: bool = False,
+        decision: str | None = None,
         local_owner=Depends(owner),
         session: Session = Depends(get_db_session),
     ) -> list[dict]:
@@ -190,11 +194,14 @@ def create_app(*, provision_owner_on_startup: bool = True) -> FastAPI:
             raise HTTPException(422, "category must be a canonical M5 category.")
         if category is not None and review:
             raise HTTPException(422, "review is a priority view and cannot be combined with category.")
+        if decision is not None and decision not in {DO, CONSIDER, CLEAN_UP}:
+            raise HTTPException(422, "decision must be do, consider, or clean_up.")
         return GmailIntelligenceService(session).feed(
             user_id=local_owner.id,
             account_id=account_id,
             category=category,
             review=review,
+            decision=decision,
         )
 
     @app.get("/api/v1/intelligence/{thread_id:uuid}", tags=["intelligence"])

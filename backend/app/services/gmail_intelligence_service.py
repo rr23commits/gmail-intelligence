@@ -175,6 +175,7 @@ class GmailIntelligenceService:
         account_id: uuid.UUID | None = None,
         category: str | None = None,
         review: bool = False,
+        decision: str | None = None,
     ) -> list[dict]:
         statement = (
             select(Classification, GmailThread, GmailAccount)
@@ -189,7 +190,11 @@ class GmailIntelligenceService:
             statement = statement.where(Classification.category == category)
         if review:
             statement = statement.where(Classification.priority_score.between(35, 79))
-        return [self._feed_item(classification, thread, account) for classification, thread, account in self.session.execute(statement)]
+        return [
+            self._feed_item(classification, thread, account)
+            for classification, thread, account in self.session.execute(statement)
+            if decision is None or _decision_bucket(classification.category, classification.priority_score) == decision
+        ]
 
     def detail(self, *, user_id: uuid.UUID, thread_id: uuid.UUID) -> dict | None:
         row = self.session.execute(
@@ -291,10 +296,10 @@ class GmailIntelligenceService:
         return sorted(preferences, key=lambda item: (-item["correction_count"], item["domain"]))
 
     def cleanup(self, *, user_id: uuid.UUID, account_id: uuid.UUID | None = None) -> dict:
-        promotional = self.feed(user_id=user_id, account_id=account_id, category="promotional_bulk")
-        notifications = self.feed(user_id=user_id, account_id=account_id, category="notification")
-        low_priority = self._safe_low_priority(user_id=user_id, account_id=account_id)
-        candidates = {item["id"]: item for item in promotional + notifications + low_priority}
+        candidates = {
+            item["id"]: item
+            for item in self.feed(user_id=user_id, account_id=account_id, decision=CLEAN_UP)
+        }
         senders = {str(thread.id): _sender_domain(message.from_address) for _, thread, _, message in self._classified_thread_rows(user_id=user_id, account_id=account_id)}
         groups: dict[tuple[str, str], list[dict]] = {}
         for item in candidates.values():
@@ -649,7 +654,7 @@ def _sender_domain(address: str) -> str:
 
 
 def _decision_bucket(category: str, priority_score: int) -> str:
-    if category == "action_required" or (category == "important_keep" and priority_score >= 80):
+    if category == "action_required":
         return DO
     if category in {"opportunity", "important_keep", "personal_conversation"}:
         return CONSIDER
