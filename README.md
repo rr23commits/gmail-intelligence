@@ -4,7 +4,7 @@ Gmail Intelligence is a local-first personal Gmail workspace. It imports one or 
 
 It is a modular monolith: a Next.js browser UI, a FastAPI API, and PostgreSQL run as separate local processes. OAuth refresh tokens are stored in the current macOS user's Keychain, not in PostgreSQL.
 
-> **Scope:** this is currently a single-local-owner application, not a multi-user hosted service. It requires a local-app password before API access and should remain behind localhost/private infrastructure unless it gains full user identity, deployment, and operations support.
+ **Scope:** this is currently a single-local-owner application, not a multi-user hosted service. It requires a local-app password before API access and should remain behind localhost/private infrastructure unless it gains full user identity, deployment, and operations support.
 
 ## What it does
 
